@@ -12,7 +12,7 @@ FAASMCTL_ROOT = dirname(dirname(realpath(__file__)))
 # able to run this file in standalone mode, as if the proto files are not
 # generated, some imports in `faasmctl` will fail
 GEN_PROTO_DIR = join(FAASMCTL_ROOT, "util", "gen_proto")
-FAASM_CLI_IMAGE = "ghcr.io/faasm/cli"
+FAASM_CLI_IMAGE = "ghcr.io/lqvd/cli"
 
 PROTO_FILES = [
     "faabric_pb2.py",
@@ -56,6 +56,7 @@ def gen_proto_files(clean=False):
 
     print("Generating Faasm (v{}) protobuf files...".format(faasm_ver))
     tmp_ctr_name = "faasm_gen_proto"
+    print(FAASM_CLI_IMAGE)
     cm = "docker run -d -i --name {} {}:{}".format(
         tmp_ctr_name, FAASM_CLI_IMAGE, faasm_ver
     )

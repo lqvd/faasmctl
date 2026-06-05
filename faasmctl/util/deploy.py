@@ -43,11 +43,10 @@ def fetch_faasm_code(faasm_source=None, force=False):
     rmtree(checkout_path, ignore_errors=True)
     makedirs(checkout_path, exist_ok=True)
 
-    print("Checking out Faasm v{} to {}".format(get_faasm_version(), checkout_path))
+    print("Checking out Faasm")
     git_cmd = [
         "git clone",
-        "--branch v{}".format(get_faasm_version()),
-        "https://github.com/faasm/faasm",
+        "https://github.com/lqvd/faasm",
         checkout_path,
     ]
     git_cmd = " ".join(git_cmd)

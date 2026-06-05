@@ -46,6 +46,7 @@ def invoke_wasm(
         req_dict = {"user": msg_dict["user"], "function": msg_dict["function"]}
 
     req = batch_exec_factory(req_dict, msg_dict, num_messages)
+    print(MessageToJson(req, indent=2))
     msg = prepare_planner_msg("EXECUTE_BATCH", MessageToJson(req, indent=None))
 
     if not ini_file:
@@ -96,17 +97,7 @@ def invoke_wasm(
 
 
 def invoke_and_await(url, json_msg, expected_num_messages, num_retries):
-    """
-    Invoke the given JSON message to the given URL and poll the planner to
-    wait for the response
-    """
     poll_period = 2
-
-    # The first invocation returns an appid to poll for the message. If there
-    # are not enough slots, this will POST will fail. In general, we want to
-    # tolerate this a number of times (for example, to accomodate for dynamic
-    # cluster sizes)
-
     sleep_period_secs = 1.5
 
     i = 0
@@ -120,39 +111,75 @@ def invoke_and_await(url, json_msg, expected_num_messages, num_retries):
         break
 
     if response.status_code != 200:
-        print(
+        raise RuntimeError(
             "POST request failed (code: {}): {}".format(
                 response.status_code, response.text
             )
         )
 
-    ber_status = Parse(response.text, BatchExecuteRequestStatus())
-    ber_status.expectedNumMessages = expected_num_messages
+    # Response from EXECUTE_BATCH. This should contain at least the appId.
+    initial_status = Parse(response.text, BatchExecuteRequestStatus())
 
-    json_msg = prepare_planner_msg(
-        "EXECUTE_BATCH_STATUS", MessageToJson(ber_status, indent=None)
+    # The planner only needs appId for EXECUTE_BATCH_STATUS.
+    poll_status = BatchExecuteRequestStatus()
+    poll_status.appId = initial_status.appId
+
+    status_msg = prepare_planner_msg(
+        "EXECUTE_BATCH_STATUS",
+        MessageToJson(poll_status, indent=None),
     )
+
     while True:
-        # Sleep at the begining, so that the app is registered as in-flight
         sleep(poll_period)
 
-        response = post(url, data=json_msg, timeout=None)
+        response = post(url, data=status_msg, timeout=None)
         if response.status_code != 200:
-            # We may query for an app result before it is finished. In this
-            # case, by default, the planner endpoint fails. But it is
-            # not an error
             if response.text == "App not registered in results":
                 pass
             else:
-                print(
+                raise RuntimeError(
                     "POST request failed (code: {}): {}".format(
                         response.status_code, response.text
                     )
                 )
-                break
         else:
             ber_status = Parse(response.text, BatchExecuteRequestStatus())
+
+            # Keep this local/client-side assignment here, after parsing the
+            # planner response. Do not send it to the planner.
+            ber_status.expectedNumMessages = expected_num_messages
+
             if ber_status.finished:
                 break
 
     return ber_status
+
+
+def invoke_wasm_no_wait(msg_dict, req_dict=None, ini_file=None):
+    """
+    Schedule a long-running service and return (appId, messageId) immediately
+    without polling for completion.
+    """
+    if req_dict is None:
+        req_dict = {"user": msg_dict["user"], "function": msg_dict["function"]}
+
+    req = batch_exec_factory(req_dict, msg_dict, 1)
+    app_id = req.appId
+    msg_id = req.messages[0].id
+
+    msg = prepare_planner_msg("EXECUTE_BATCH", MessageToJson(req, indent=None))
+
+    if not ini_file:
+        ini_file = get_faasm_ini_file()
+
+    host, port = get_faasm_planner_host_port(ini_file, in_docker())
+    url = "http://{}:{}".format(host, port)
+
+    response = post(url, data=msg, timeout=None)
+    if response.status_code != 200:
+        print("POST request failed (code: {}): {}".format(
+            response.status_code, response.text
+        ))
+        raise RuntimeError("Failed to schedule service")
+
+    return app_id, msg_id

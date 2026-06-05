@@ -11,6 +11,7 @@ from . import monitor
 from . import restart
 from . import s3
 from . import scale
+from . import service
 from . import status
 from . import upload
 
@@ -26,6 +27,7 @@ task_ns = Collection(
     restart,
     s3,
     scale,
+    service,
     status,
     upload,
 )

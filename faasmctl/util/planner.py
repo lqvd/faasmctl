@@ -1,6 +1,8 @@
 from faasmctl.util.config import get_faasm_ini_file, get_faasm_planner_host_port
 from faasmctl.util.gen_proto.planner_pb2 import (
     AvailableHostsResponse,
+    DiscoverServiceResponse,
+    DiscoverServiceRequest,
     GetInFlightAppsResponse,
     HttpMessage,
     SetEvictedVmIpsRequest,
@@ -44,6 +46,8 @@ def prepare_planner_msg(msg_type, msg_body=None):
         http_message.type = HttpMessage.Type.SET_NEXT_EVICTED_VM
     elif msg_type == "SET_POLICY":
         http_message.type = HttpMessage.Type.SET_POLICY
+    elif msg_type == "DISCOVER_SERVICE":
+        http_message.type = HttpMessage.Type.DISCOVER_SERVICE
     else:
         raise RuntimeError("Unrecognised HTTP msg type: {}".format(msg_type))
 
@@ -199,3 +203,24 @@ def set_planner_policy(policy):
             )
         )
         raise RuntimeError("Error setting planner policy")
+
+def discover_service(user, func, ini_file=None):
+    if not ini_file:
+        ini_file = get_faasm_ini_file()
+    host, port = get_faasm_planner_host_port(ini_file)
+    url = "http://{}:{}".format(host, port)
+
+    req = DiscoverServiceRequest()
+    req.serviceName = "{}/{}".format(user, func)
+    planner_msg = prepare_planner_msg(
+        "DISCOVER_SERVICE", MessageToJson(req, indent=None)
+    )
+    print(planner_msg)
+    response = post(url, data=planner_msg, timeout=None)
+    if response.status_code != 200:
+        print("Error discovering service {}/{}: {}".format(
+            user, func, response.text
+        ))
+        return None
+    resp = Parse(response.text, DiscoverServiceResponse())
+    return resp.endpoint if resp.found else None

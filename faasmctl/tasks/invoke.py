@@ -22,6 +22,7 @@ def invoke(
     single_host=False,
     host_dist=None,
     output_format=None,
+    isRpc=False,
 ):
     """
     Invoke the execution of a user/func pair
@@ -41,6 +42,10 @@ def invoke(
         msg_dict["mpi_world_size"] = int(mpi_world_size)
     if single_host:
         req_dict["singleHostHint"] = single_host
+    if long_running:
+        msg_dict["is_long_running"] = True
+    if isRpc:
+        msg_dict["isRpc"] = True
     if host_dist:
         host_dist = host_dist.split(",")
         # Prepare a host distribution
