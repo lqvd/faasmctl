@@ -42,8 +42,6 @@ def invoke(
         msg_dict["mpi_world_size"] = int(mpi_world_size)
     if single_host:
         req_dict["singleHostHint"] = single_host
-    if long_running:
-        msg_dict["is_long_running"] = True
     if isRpc:
         msg_dict["isRpc"] = True
     if host_dist:
