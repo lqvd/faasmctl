@@ -32,6 +32,40 @@ def get_faasm_version():
 
     return version
 
+def gen_proto_files_local():
+    """
+    Generate python proto files using the local checkout/container,
+    without starting another Docker container.
+    """
+    code_dir = "/usr/local/code/faasm/faabric"
+
+    find_protoc_cmd = "find ~/.conan2 -name protoc"
+    protoc_bin = (
+        run(find_protoc_cmd, shell=True, check=True, capture_output=True)
+        .stdout.decode("utf-8")
+        .split("\n")
+    )
+    p_bin = [p for p in protoc_bin if "/bin/" in p or p.endswith("/protoc")]
+    p_bin = p_bin[0].strip()
+
+    protoc_cmd = [
+        p_bin,
+        "--proto_path={}".format(code_dir),
+        "--python_out={}".format(code_dir),
+        "{}/src/planner/planner.proto".format(code_dir),
+        "{}/src/proto/faabric.proto".format(code_dir),
+    ]
+
+    run(" ".join(protoc_cmd), shell=True, check=True)
+
+    for proto_file in PROTO_FILES:
+        if "planner" in proto_file:
+            proto_src_path = join(code_dir, "src", "planner", proto_file)
+        else:
+            proto_src_path = join(code_dir, "src", "proto", proto_file)
+
+        proto_dst_path = join(GEN_PROTO_DIR, proto_file)
+        run("cp {} {}".format(proto_src_path, proto_dst_path), shell=True, check=True)
 
 def gen_proto_files(clean=False):
     """
@@ -55,7 +89,14 @@ def gen_proto_files(clean=False):
         faasm_ver = get_faasm_version()
 
     print("Generating Faasm (v{}) protobuf files...".format(faasm_ver))
+
+    if environ.get("FAASM_GEN_PROTO_LOCAL") == "on":
+        gen_proto_files_local()
+        print("Done generating protobuf files!")
+        return
+
     tmp_ctr_name = "faasm_gen_proto"
+    
     print(FAASM_CLI_IMAGE)
     cm = "docker run -d -i --name {} {}:{}".format(
         tmp_ctr_name, FAASM_CLI_IMAGE, faasm_ver
