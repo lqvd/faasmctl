@@ -1,5 +1,12 @@
-from faasmctl.util.gen_proto.faabric_pb2 import RpcShutdownRequest
-from faasmctl.util.planner import discover_service
+from faasmctl.util.config import (
+    get_faasm_ini_file,
+    get_faasm_planner_host_port,
+)
+from faasmctl.util.gen_proto.planner_pb2 import DiscoverServiceRequest
+from faasmctl.util.planner import (
+    shutdown_service,
+    prepare_planner_msg
+)
 from faasmctl.util.invoke import invoke_wasm_no_wait
 from google.protobuf.json_format import MessageToJson
 from invoke import task
@@ -25,21 +32,4 @@ def start(ctx, user, func, ini_file=None):
 
 @task
 def shutdown(ctx, user, func, ini_file=None):
-    """Shutdown a long-running RPC service"""
-    endpoint = discover_service(user, func, ini_file)
-    if endpoint is None:
-        print("ERROR: service {}/{} not found".format(user, func))
-        return 1
-
-    req = RpcShutdownRequest()
-    req.targetAppId = endpoint.appId
-    req.targetMessageId = endpoint.messageId
-
-    # Shutdown goes directly to the worker, not through the planner
-    url = "http://{}:{}".format(endpoint.host, RPC_ASYNC_PORT)
-    response = post(url, data=MessageToJson(req, indent=None), timeout=None)
-    if response.status_code != 200:
-        print("Shutdown failed: {}".format(response.text))
-        return 1
-
-    print("Shutdown sent to {}/{} on {}".format(user, func, endpoint.host))
+    shutdown_service(user, func, ini_file)

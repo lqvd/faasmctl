@@ -3,6 +3,7 @@ from invoke import Collection
 from . import cli
 from . import delete
 from . import deploy
+from . import experiment
 from . import flush
 from . import generate
 from . import invoke
@@ -19,6 +20,7 @@ task_ns = Collection(
     cli,
     delete,
     deploy,
+    experiment,
     generate,
     flush,
     invoke,

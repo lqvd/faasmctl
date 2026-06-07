@@ -48,6 +48,8 @@ def prepare_planner_msg(msg_type, msg_body=None):
         http_message.type = HttpMessage.Type.SET_POLICY
     elif msg_type == "DISCOVER_SERVICE":
         http_message.type = HttpMessage.Type.DISCOVER_SERVICE
+    elif msg_type == "SHUTDOWN_SERVICE":
+        http_message.type = HttpMessage.Type.SHUTDOWN_SERVICE
     else:
         raise RuntimeError("Unrecognised HTTP msg type: {}".format(msg_type))
 
@@ -224,3 +226,20 @@ def discover_service(user, func, ini_file=None):
         return None
     resp = Parse(response.text, DiscoverServiceResponse())
     return resp.endpoint if resp.found else None
+
+def shutdown_service(user, func, ini_file=None):
+    if not ini_file:
+        ini_file = get_faasm_ini_file()
+    host, port = get_faasm_planner_host_port(ini_file)
+    url = "http://{}:{}".format(host, port)
+
+    req = DiscoverServiceRequest()
+    req.serviceName = "{}/{}".format(user, func)
+    planner_msg = prepare_planner_msg(
+        "SHUTDOWN_SERVICE", MessageToJson(req, indent=None)
+    )
+    response = post(url, data=planner_msg, timeout=None)
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Shutdown failed for {}/{}: {}".format(user, func, response.text)
+        )
