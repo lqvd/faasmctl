@@ -19,7 +19,7 @@ FORCED_POLICY = "force"
 DISCOVER_POLL_PERIOD_S = 2
 
 
-def run(ini_file=None, fan_out=4, num_workers=2):
+def run(ini_file=None, fan_out=2, num_workers=2):
     """
     Migration correctness experiment.
 
@@ -43,17 +43,17 @@ def run(ini_file=None, fan_out=4, num_workers=2):
     print("[1/6] Resetting planner and waiting for {} workers...".format(num_workers))
     reset(expected_num_workers=num_workers, verbose=True)
 
-    # 2. Set policy
-    print("[2/6] Setting scheduler policy to {}...".format(FORCED_POLICY))
-    set_planner_policy(FORCED_POLICY)
-
-    # 3. Start the service
-    print("[3/6] Starting {}/{} service...".format(SERVICE_USER, SERVICE_FUNC))
+    # 2. Start the service
+    print("[2/6] Starting {}/{} service...".format(SERVICE_USER, SERVICE_FUNC))
     app_id, msg_id = invoke_wasm_no_wait(
         {"user": SERVICE_USER, "function": SERVICE_FUNC, "isRpc": True, "is_long_running": True},
         ini_file=ini_file,
     )
     print("      appId={} messageId={}".format(app_id, msg_id))
+
+        # 3. Set policy
+    # print("[3/6] Setting scheduler policy to {}...".format(FORCED_POLICY))
+    set_planner_policy("spot")
 
     # 4. Wait for service to register as ready
     print("[4/6] Polling until service is discoverable...")
@@ -65,6 +65,11 @@ def run(ini_file=None, fan_out=4, num_workers=2):
             sleep(DISCOVER_POLL_PERIOD_S)
     print("      Service ready at {}".format(endpoint))
 
+    # 3. Set policy
+    print("[3/6] Setting scheduler policy to {}...".format(FORCED_POLICY))
+    set_planner_policy(FORCED_POLICY)
+
+
     # 5. Invoke benchmark
     print("[5/6] Invoking benchmark (fan-out={})...".format(fan_out))
     result = invoke_wasm(
@@ -72,6 +77,7 @@ def run(ini_file=None, fan_out=4, num_workers=2):
             "user": BENCHMARK_USER,
             "function": BENCHMARK_FUNC,
             "cmdline": str(fan_out),
+            "isRpc": True,
         },
         ini_file=ini_file,
     )
