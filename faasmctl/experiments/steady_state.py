@@ -1,7 +1,7 @@
 import csv
 import os
 from pathlib import Path
-from time import sleep
+from time import sleep, time
 
 from faasmctl.util.batch import batch_exec_factory
 from faasmctl.util.config import (
@@ -33,11 +33,10 @@ DISCOVER_POLL_PERIOD_S = 2
 # before another reset. This avoids reset racing with late SetMessageResult.
 SERVICE_QUIESCE_PERIOD_S = 5
 
-# Small pause between client repeats so we do not immediately hammer the
-# planner after each result.
-CLIENT_REPEAT_PAUSE_S = 1
+# How long to wait for DiscoverService to stop finding the service after
+# shutdown. If this times out, we still continue after the quiesce sleep.
+SERVICE_STOP_TIMEOUT_S = 20
 
-# Use a normal placement policy. Do not use the forced migration policy here.
 STEADY_STATE_POLICY = "spot"
 
 
@@ -245,17 +244,52 @@ def _wait_for_service(ini_file=None):
     return endpoint
 
 
+def _wait_for_service_gone(ini_file=None):
+    deadline = time() + SERVICE_STOP_TIMEOUT_S
+
+    while time() < deadline:
+        try:
+            endpoint = discover_service(
+                SERVICE_USER,
+                SERVICE_FUNC,
+                ini_file=ini_file,
+            )
+        except Exception as e:
+            print("         Warning while checking service shutdown: {}".format(e))
+            return
+
+        if endpoint is None:
+            print("         Service no longer discoverable.")
+            return
+
+        print("         Service still discoverable, waiting...")
+        sleep(DISCOVER_POLL_PERIOD_S)
+
+    print(
+        "         Warning: service still discoverable after {}s".format(
+            SERVICE_STOP_TIMEOUT_S
+        )
+    )
+
+
 def _shutdown_service_quietly(ini_file=None):
     print("[cleanup] Shutting down {}/{}...".format(SERVICE_USER, SERVICE_FUNC))
 
     try:
         shutdown_service(SERVICE_USER, SERVICE_FUNC, ini_file=ini_file)
-        print("         Done.")
+        print("         Shutdown request sent.")
     except Exception as e:
         # Catch connection errors as well as RuntimeError. Cleanup should not
         # hide the original failure with a second traceback.
         print("         Warning: {}".format(e))
 
+    _wait_for_service_gone(ini_file=ini_file)
+
+    print(
+        "         Quiescing for {}s before next reset...".format(
+            SERVICE_QUIESCE_PERIOD_S
+        )
+    )
     sleep(SERVICE_QUIESCE_PERIOD_S)
 
 
@@ -406,11 +440,14 @@ def run_once(
     out_dir="steady_state_results",
 ):
     """
-    Runs one steady-state RPC benchmark configuration.
+    Runs one steady-state RPC benchmark run.
 
-    This is retained for one-off debugging. The normal benchmark path should
-    use run_sweep(), which starts the service once and runs all client repeats
-    before shutdown.
+    Lifecycle:
+      reset planner
+      start service
+      run client
+      shutdown service
+      wait for stale async planner messages to settle
     """
     print("=== Steady-State RPC Benchmark ===")
     print(
@@ -480,8 +517,8 @@ def run_sweep(
     For remote placement:
       service_host != client_host
 
-    The service is started once for the whole sweep. This avoids racing planner
-    reset against late async messages from the previous long-running service.
+    The service is started and stopped for every repeat. This avoids carrying
+    service state across measurements.
     """
     rows = []
 
@@ -498,40 +535,22 @@ def run_sweep(
     )
     print("service_host={} client_host={}".format(service_host, client_host))
 
-    try:
-        _start_service_once(
-            ini_file=ini_file,
-            num_workers=num_workers,
-            service_host=service_host,
-        )
-
-        print("[5/5] Running client repeats...")
-        summary_path = os.path.join(out_dir, "summary.csv")
-
-        for concurrency in concurrencies:
-            for repeat in range(repeats):
-                row = _run_client_once(
-                    ini_file=ini_file,
-                    total_requests=total_requests,
-                    concurrency=concurrency,
-                    payload_bytes=payload_bytes,
-                    method=method,
-                    service_host=service_host,
-                    client_host=client_host,
-                    placement=placement,
-                    repeat=repeat,
-                    out_dir=out_dir,
-                )
-
-                _append_summary_csv(summary_path, row)
-                print("         Summary appended to {}".format(summary_path))
-
-                rows.append(row)
-
-                sleep(CLIENT_REPEAT_PAUSE_S)
-
-    finally:
-        _shutdown_service_quietly(ini_file=ini_file)
+    for concurrency in concurrencies:
+        for repeat in range(repeats):
+            row = run_once(
+                ini_file=ini_file,
+                num_workers=num_workers,
+                total_requests=total_requests,
+                concurrency=concurrency,
+                payload_bytes=payload_bytes,
+                method=method,
+                service_host=service_host,
+                client_host=client_host,
+                placement=placement,
+                repeat=repeat,
+                out_dir=out_dir,
+            )
+            rows.append(row)
 
     return rows
 
