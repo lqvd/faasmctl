@@ -10,7 +10,6 @@ from faasmctl.util.config import (
 )
 from faasmctl.util.docker import in_docker
 from faasmctl.util.invoke import invoke_wasm
-from faasmctl.util.message import message_factory
 from faasmctl.util.planner import (
     discover_service,
     prepare_planner_msg,
@@ -29,6 +28,14 @@ BENCHMARK_USER = "rpc"
 BENCHMARK_FUNC = "SteadyStateBench"
 
 DISCOVER_POLL_PERIOD_S = 2
+
+# Give async planner messages from the long-running service time to settle
+# before another reset. This avoids reset racing with late SetMessageResult.
+SERVICE_QUIESCE_PERIOD_S = 5
+
+# Small pause between client repeats so we do not immediately hammer the
+# planner after each result.
+CLIENT_REPEAT_PAUSE_S = 1
 
 # Use a normal placement policy. Do not use the forced migration policy here.
 STEADY_STATE_POLICY = "spot"
@@ -228,12 +235,161 @@ def _wait_for_service(ini_file=None):
     while endpoint is None:
         endpoint = discover_service(SERVICE_USER, SERVICE_FUNC, ini_file=ini_file)
         if endpoint is None:
-            print("      Service not ready, retrying in {}s...".format(
-                DISCOVER_POLL_PERIOD_S
-            ))
+            print(
+                "      Service not ready, retrying in {}s...".format(
+                    DISCOVER_POLL_PERIOD_S
+                )
+            )
             sleep(DISCOVER_POLL_PERIOD_S)
 
     return endpoint
+
+
+def _shutdown_service_quietly(ini_file=None):
+    print("[cleanup] Shutting down {}/{}...".format(SERVICE_USER, SERVICE_FUNC))
+
+    try:
+        shutdown_service(SERVICE_USER, SERVICE_FUNC, ini_file=ini_file)
+        print("         Done.")
+    except Exception as e:
+        # Catch connection errors as well as RuntimeError. Cleanup should not
+        # hide the original failure with a second traceback.
+        print("         Warning: {}".format(e))
+
+    sleep(SERVICE_QUIESCE_PERIOD_S)
+
+
+def _start_service_once(
+    ini_file=None,
+    num_workers=2,
+    service_host=None,
+):
+    print("[1/5] Resetting planner and waiting for {} workers...".format(num_workers))
+    reset(expected_num_workers=num_workers, verbose=True)
+
+    print("[2/5] Setting scheduler policy to {}...".format(STEADY_STATE_POLICY))
+    set_planner_policy(STEADY_STATE_POLICY)
+
+    print("[3/5] Starting {}/{} service...".format(SERVICE_USER, SERVICE_FUNC))
+    app_id, msg_id = invoke_wasm_no_wait_placed(
+        {
+            "user": SERVICE_USER,
+            "function": SERVICE_FUNC,
+            "isRpc": True,
+            "is_long_running": True,
+        },
+        ini_file=ini_file,
+        host=service_host,
+    )
+    print("      appId={} messageId={}".format(app_id, msg_id))
+
+    print("[4/5] Polling until service is discoverable...")
+    endpoint = _wait_for_service(ini_file=ini_file)
+    print("      Service ready at {}".format(endpoint))
+
+    if service_host is not None and service_host not in str(endpoint):
+        raise RuntimeError(
+            "Expected service on host {}, but discovered endpoint is {}".format(
+                service_host,
+                endpoint,
+            )
+        )
+
+    return app_id, msg_id, endpoint
+
+
+def _run_client_once(
+    ini_file=None,
+    total_requests=1000,
+    concurrency=1,
+    payload_bytes=64,
+    method="echo",
+    service_host=None,
+    client_host=None,
+    placement="unknown",
+    repeat=0,
+    out_dir="steady_state_results",
+):
+    print(
+        "[client] placement={} repeat={} total={} concurrency={} "
+        "payload={} method={}".format(
+            placement,
+            repeat,
+            total_requests,
+            concurrency,
+            payload_bytes,
+            method,
+        )
+    )
+
+    cmdline = "{} {} {} {}".format(
+        total_requests,
+        concurrency,
+        payload_bytes,
+        method,
+    )
+
+    host_list = [client_host] if client_host is not None else None
+
+    result = invoke_wasm(
+        {
+            "user": BENCHMARK_USER,
+            "function": BENCHMARK_FUNC,
+            "cmdline": cmdline,
+            "isRpc": True,
+        },
+        ini_file=ini_file,
+        host_list=host_list,
+        num_retries=30,
+    )
+
+    message_result = result.messageResults[0]
+    output = _normalise_output(message_result.outputData)
+    ret_code = message_result.returnValue
+
+    raw_path = os.path.join(
+        out_dir,
+        "raw",
+        "raw_{}_c{}_r{}.csv".format(placement, concurrency, repeat),
+    )
+    _write_raw_csv(raw_path, output)
+    print("         Raw CSV written to {}".format(raw_path))
+
+    parsed = _parse_benchmark_csv(output)
+
+    result_row = {
+        "placement": placement,
+        "repeat": repeat,
+        "service_host": service_host or "",
+        "client_host": client_host or "",
+        "total_requests": total_requests,
+        "concurrency": concurrency,
+        "payload_bytes": payload_bytes,
+        "method": method,
+        "successes": parsed["successes"],
+        "failures": parsed["failures"],
+        "duration_ns": parsed["duration_ns"],
+        "throughput_rps": parsed["throughput_rps"],
+        "p50_ns": parsed["p50_ns"],
+        "p99_ns": parsed["p99_ns"],
+        "p999_ns": parsed["p999_ns"],
+        "max_ns": parsed["max_ns"],
+        "return_code": ret_code,
+    }
+
+    print(
+        "         successes={} failures={} throughput={:.2f} rps "
+        "p50={:.0f}ns p99={:.0f}ns p999={:.0f}ns".format(
+            parsed["successes"],
+            parsed["failures"],
+            parsed["throughput_rps"],
+            parsed["p50_ns"] or 0,
+            parsed["p99_ns"] or 0,
+            parsed["p999_ns"] or 0,
+        )
+    )
+
+    return result_row
 
 
 def run_once(
@@ -252,16 +408,9 @@ def run_once(
     """
     Runs one steady-state RPC benchmark configuration.
 
-    service_host:
-      Worker IP/hostname on which to start BenchSvc.
-      If None, planner decides.
-
-    client_host:
-      Worker IP/hostname on which to run the benchmark client.
-      If None, planner decides.
-
-    placement:
-      Label used in output CSV, e.g. "local" or "remote".
+    This is retained for one-off debugging. The normal benchmark path should
+    use run_sweep(), which starts the service once and runs all client repeats
+    before shutdown.
     """
     print("=== Steady-State RPC Benchmark ===")
     print(
@@ -279,127 +428,32 @@ def run_once(
     result_row = None
 
     try:
-        print("[1/6] Resetting planner and waiting for {} workers...".format(
-            num_workers
-        ))
-        reset(expected_num_workers=num_workers, verbose=True)
-
-        print("[2/6] Setting scheduler policy to {}...".format(
-            STEADY_STATE_POLICY
-        ))
-        set_planner_policy(STEADY_STATE_POLICY)
-
-        print("[3/6] Starting {}/{} service...".format(
-            SERVICE_USER,
-            SERVICE_FUNC,
-        ))
-        app_id, msg_id = invoke_wasm_no_wait_placed(
-            {
-                "user": SERVICE_USER,
-                "function": SERVICE_FUNC,
-                "isRpc": True,
-                "is_long_running": True,
-            },
+        _start_service_once(
             ini_file=ini_file,
-            host=service_host,
-        )
-        print("      appId={} messageId={}".format(app_id, msg_id))
-
-        print("[4/6] Polling until service is discoverable...")
-        endpoint = _wait_for_service(ini_file=ini_file)
-        print("      Service ready at {}".format(endpoint))
-
-        if service_host is not None and service_host not in str(endpoint):
-            raise RuntimeError(
-                "Expected service on host {}, but discovered endpoint is {}".format(
-                    service_host,
-                    endpoint,
-                )
-            )
-
-        print("[5/6] Invoking benchmark client...")
-        cmdline = "{} {} {} {}".format(
-            total_requests,
-            concurrency,
-            payload_bytes,
-            method,
+            num_workers=num_workers,
+            service_host=service_host,
         )
 
-        host_list = [client_host] if client_host is not None else None
-
-        result = invoke_wasm(
-            {
-                "user": BENCHMARK_USER,
-                "function": BENCHMARK_FUNC,
-                "cmdline": cmdline,
-                "isRpc": True,
-            },
+        print("[5/5] Invoking benchmark client...")
+        result_row = _run_client_once(
             ini_file=ini_file,
-            host_list=host_list,
-            num_retries=30,
+            total_requests=total_requests,
+            concurrency=concurrency,
+            payload_bytes=payload_bytes,
+            method=method,
+            service_host=service_host,
+            client_host=client_host,
+            placement=placement,
+            repeat=repeat,
+            out_dir=out_dir,
         )
-
-        message_result = result.messageResults[0]
-        output = _normalise_output(message_result.outputData)
-        ret_code = message_result.returnValue
-
-        raw_path = os.path.join(
-            out_dir,
-            "raw",
-            "raw_{}_c{}_r{}.csv".format(placement, concurrency, repeat),
-        )
-        _write_raw_csv(raw_path, output)
-        print("      Raw CSV written to {}".format(raw_path))
-
-        print("[6/6] Parsing benchmark output...")
-        parsed = _parse_benchmark_csv(output)
-
-        result_row = {
-            "placement": placement,
-            "repeat": repeat,
-            "service_host": service_host or "",
-            "client_host": client_host or "",
-            "total_requests": total_requests,
-            "concurrency": concurrency,
-            "payload_bytes": payload_bytes,
-            "method": method,
-            "successes": parsed["successes"],
-            "failures": parsed["failures"],
-            "duration_ns": parsed["duration_ns"],
-            "throughput_rps": parsed["throughput_rps"],
-            "p50_ns": parsed["p50_ns"],
-            "p99_ns": parsed["p99_ns"],
-            "p999_ns": parsed["p999_ns"],
-            "max_ns": parsed["max_ns"],
-            "return_code": ret_code,
-        }
 
         summary_path = os.path.join(out_dir, "summary.csv")
         _append_summary_csv(summary_path, result_row)
-
-        print("      Summary appended to {}".format(summary_path))
-        print(
-            "      successes={} failures={} throughput={:.2f} rps "
-            "p50={:.0f}ns p99={:.0f}ns p999={:.0f}ns".format(
-                parsed["successes"],
-                parsed["failures"],
-                parsed["throughput_rps"],
-                parsed["p50_ns"] or 0,
-                parsed["p99_ns"] or 0,
-                parsed["p999_ns"] or 0,
-            )
-        )
+        print("         Summary appended to {}".format(summary_path))
 
     finally:
-        print("[cleanup] Shutting down {}/{}...".format(
-            SERVICE_USER,
-            SERVICE_FUNC,
-        ))
-        try:
-            shutdown_service(SERVICE_USER, SERVICE_FUNC, ini_file=ini_file)
-            print("         Done.")
-        except RuntimeError as e:
-            print("         Warning: {}".format(e))
+        _shutdown_service_quietly(ini_file=ini_file)
 
     return result_row
 
@@ -425,25 +479,59 @@ def run_sweep(
 
     For remote placement:
       service_host != client_host
+
+    The service is started once for the whole sweep. This avoids racing planner
+    reset against late async messages from the previous long-running service.
     """
     rows = []
 
-    for repeat in range(repeats):
+    print("=== Steady-State RPC Benchmark Sweep ===")
+    print(
+        "placement={} total={} concurrencies={} repeats={} payload={} method={}".format(
+            placement,
+            total_requests,
+            concurrencies,
+            repeats,
+            payload_bytes,
+            method,
+        )
+    )
+    print("service_host={} client_host={}".format(service_host, client_host))
+
+    try:
+        _start_service_once(
+            ini_file=ini_file,
+            num_workers=num_workers,
+            service_host=service_host,
+        )
+
+        print("[5/5] Running client repeats...")
+        summary_path = os.path.join(out_dir, "summary.csv")
+
         for concurrency in concurrencies:
-            row = run_once(
-                ini_file=ini_file,
-                num_workers=num_workers,
-                total_requests=total_requests,
-                concurrency=concurrency,
-                payload_bytes=payload_bytes,
-                method=method,
-                service_host=service_host,
-                client_host=client_host,
-                placement=placement,
-                repeat=repeat,
-                out_dir=out_dir,
-            )
-            rows.append(row)
+            for repeat in range(repeats):
+                row = _run_client_once(
+                    ini_file=ini_file,
+                    total_requests=total_requests,
+                    concurrency=concurrency,
+                    payload_bytes=payload_bytes,
+                    method=method,
+                    service_host=service_host,
+                    client_host=client_host,
+                    placement=placement,
+                    repeat=repeat,
+                    out_dir=out_dir,
+                )
+
+                _append_summary_csv(summary_path, row)
+                print("         Summary appended to {}".format(summary_path))
+
+                rows.append(row)
+
+                sleep(CLIENT_REPEAT_PAUSE_S)
+
+    finally:
+        _shutdown_service_quietly(ini_file=ini_file)
 
     return rows
 
