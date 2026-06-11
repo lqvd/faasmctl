@@ -22,6 +22,7 @@ from faasmctl.util.planner import (
 from google.protobuf.json_format import MessageToJson
 from requests import post
 
+
 SERVICE_USER = "snb"
 
 SERVICES = [
@@ -39,11 +40,18 @@ BENCHMARK_USER = "snb"
 BENCHMARK_FUNC = "benchmark_snb"
 
 DISCOVER_POLL_PERIOD_S = 2
-SERVICE_STOP_TIMEOUT_S = 30
-SERVICE_MOVE_TIMEOUT_S = 120
+
+# Give async planner messages from long-running services time to settle before
+# another reset. This avoids reset racing with late SetMessageResult.
 SERVICE_QUIESCE_PERIOD_S = 5
 
-POLICY = "spot"
+# How long to wait for DiscoverService to stop finding a service after shutdown.
+SERVICE_STOP_TIMEOUT_S = 30
+
+# How long to wait for a live-migrated service discovery entry to move.
+SERVICE_MOVE_TIMEOUT_S = 120
+
+COMPOSE_MIGRATION_POLICY = "spot"
 
 
 def _as_bool(value):
@@ -56,8 +64,7 @@ def _as_bool(value):
     if value is None:
         return False
 
-    s = str(value).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _normalise_output(output):
@@ -70,7 +77,6 @@ def _endpoint_host(endpoint):
     if endpoint is None:
         return None
 
-    # DiscoverServiceResponse.endpoint is usually a protobuf with a host field.
     if hasattr(endpoint, "host"):
         return endpoint.host
 
@@ -97,7 +103,7 @@ def _percentile(values, q):
     return xs[lo] * (1.0 - frac) + xs[hi] * frac
 
 
-def _parse_compose_csv(output):
+def _parse_benchmark_csv(output):
     """
     Parses output from benchmark_snb.
 
@@ -169,11 +175,14 @@ def _write_raw_csv(path, output):
 def _append_summary_csv(path, row):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    file_exists = os.path.exists(path)
+    exists = os.path.exists(path)
 
     fieldnames = [
         "scenario",
         "repeat",
+        "success",
+        "zero_failures",
+        "event_success",
         "target_service",
         "source_host",
         "dest_host",
@@ -181,8 +190,6 @@ def _append_summary_csv(path, row):
         "trigger_after_s",
         "event_start_rel_ns_approx",
         "event_duration_s",
-        "event_start_s",
-        "event_end_s",
         "event_endpoint",
         "target_app_id",
         "target_msg_id",
@@ -210,7 +217,7 @@ def _append_summary_csv(path, row):
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
 
-        if not file_exists:
+        if not exists:
             writer.writeheader()
 
         writer.writerow(row)
@@ -226,6 +233,82 @@ def _planner_url(ini_file=None):
     )
 
     return "http://{}:{}".format(planner_host, planner_port)
+
+
+def invoke_wasm_no_wait_placed(
+    user,
+    func,
+    ini_file=None,
+    host=None,
+):
+    """
+    Like invoke_wasm_no_wait, but optionally preloads a scheduling decision so
+    the long-running service starts on a specific worker.
+
+    Returns:
+      (app_id, group_id, message_id)
+    """
+    req_dict = {
+        "user": user,
+        "function": func,
+    }
+
+    msg_dict = {
+        "user": user,
+        "function": func,
+        "isRpc": True,
+        "is_long_running": True,
+    }
+
+    req = batch_exec_factory(req_dict, msg_dict, 1)
+
+    app_id = req.appId
+    group_id = req.groupId
+    msg_id = req.messages[0].id
+
+    # Prepare EXECUTE_BATCH before mutating executedHost, matching the existing
+    # invoke_wasm host_list behaviour and the distributed migration tests.
+    exec_msg = prepare_planner_msg(
+        "EXECUTE_BATCH",
+        MessageToJson(req, indent=None),
+    )
+
+    url = _planner_url(ini_file=ini_file)
+
+    if host is not None:
+        req.messages[0].groupIdx = 0
+        req.messages[0].executedHost = host
+
+        preload_msg = prepare_planner_msg(
+            "PRELOAD_SCHEDULING_DECISION",
+            MessageToJson(req, indent=None),
+        )
+
+        response = post(url, data=preload_msg, timeout=None)
+        if response.status_code != 200:
+            raise RuntimeError(
+                "Error preloading service scheduling decision for {}/{} "
+                "on host {} (code={}): {}".format(
+                    user,
+                    func,
+                    host,
+                    response.status_code,
+                    response.text,
+                )
+            )
+
+    response = post(url, data=exec_msg, timeout=None)
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Failed to schedule service {}/{} (code={}): {}".format(
+                user,
+                func,
+                response.status_code,
+                response.text,
+            )
+        )
+
+    return app_id, group_id, msg_id
 
 
 def _wait_for_service(user, func, ini_file=None):
@@ -255,7 +338,7 @@ def _wait_for_service_gone(user, func, ini_file=None):
             endpoint = discover_service(user, func, ini_file=ini_file)
         except Exception as e:
             print(
-                "         Warning while checking shutdown of {}/{}: {}".format(
+                "         Warning while checking {}/{} shutdown: {}".format(
                     user,
                     func,
                     e,
@@ -268,10 +351,9 @@ def _wait_for_service_gone(user, func, ini_file=None):
             return
 
         print(
-            "         {}/{} still discoverable at {}, waiting...".format(
+            "         {}/{} still discoverable, waiting...".format(
                 user,
                 func,
-                endpoint,
             )
         )
         sleep(DISCOVER_POLL_PERIOD_S)
@@ -290,11 +372,11 @@ def _wait_for_service_on_host(user, func, expected_host, ini_file=None):
 
     while time() < deadline:
         endpoint = discover_service(user, func, ini_file=ini_file)
-        host = _endpoint_host(endpoint)
+        endpoint_host = _endpoint_host(endpoint)
 
-        if endpoint is not None and host == expected_host:
+        if endpoint is not None and endpoint_host == expected_host:
             print(
-                "         {}/{} now discoverable on {}".format(
+                "         {}/{} now discoverable at {}".format(
                     user,
                     func,
                     endpoint,
@@ -302,11 +384,10 @@ def _wait_for_service_on_host(user, func, expected_host, ini_file=None):
             )
             return endpoint
 
-        # Fall back to substring matching in case endpoint is represented
-        # differently by the Python protobuf wrapper.
+        # Fallback for endpoint string representations.
         if endpoint is not None and expected_host in str(endpoint):
             print(
-                "         {}/{} now discoverable on {}".format(
+                "         {}/{} now discoverable at {}".format(
                     user,
                     func,
                     endpoint,
@@ -315,7 +396,7 @@ def _wait_for_service_on_host(user, func, expected_host, ini_file=None):
             return endpoint
 
         print(
-            "         waiting for {}/{} to move to {} "
+            "         Waiting for {}/{} to move to {} "
             "(current endpoint={})...".format(
                 user,
                 func,
@@ -334,133 +415,23 @@ def _wait_for_service_on_host(user, func, expected_host, ini_file=None):
     )
 
 
-def _start_service(user, func, host=None, ini_file=None):
-    """
-    Start one long-running RPC service.
-
-    If host is provided, this preloads the initial scheduling decision for the
-    same request that is then sent via EXECUTE_BATCH. This mirrors the
-    distributed migration tests: one service request, one app/message identity.
-    """
-    print("[service] starting {}/{} host={}".format(user, func, host or ""))
-
-    req_dict = {
-        "user": user,
-        "function": func,
-    }
-
-    msg_dict = {
-        "user": user,
-        "function": func,
-        "isRpc": True,
-        "is_long_running": True,
-    }
-
-    req = batch_exec_factory(req_dict, msg_dict, 1)
-
-    app_id = req.appId
-    group_id = req.groupId
-    msg_id = req.messages[0].id
-
-    # Prepare EXECUTE_BATCH before mutating executedHost, matching the existing
-    # host_list/preload behaviour.
-    exec_msg = prepare_planner_msg(
-        "EXECUTE_BATCH",
-        MessageToJson(req, indent=None),
-    )
-
-    url = _planner_url(ini_file=ini_file)
-
-    if host is not None:
-        req.messages[0].groupIdx = 0
-        req.messages[0].executedHost = host
-
-        preload_msg = prepare_planner_msg(
-            "PRELOAD_SCHEDULING_DECISION",
-            MessageToJson(req, indent=None),
-        )
-
-        response = post(url, data=preload_msg, timeout=None)
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                "Error preloading initial placement for {}/{} "
-                "appId={} groupId={} msgId={} host={} "
-                "(code={}): {}".format(
-                    user,
-                    func,
-                    app_id,
-                    group_id,
-                    msg_id,
-                    host,
-                    response.status_code,
-                    response.text,
-                )
-            )
-
-    response = post(url, data=exec_msg, timeout=None)
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            "Failed to schedule service {}/{} "
-            "appId={} groupId={} msgId={} "
-            "(code={}): {}".format(
-                user,
-                func,
-                app_id,
-                group_id,
-                msg_id,
-                response.status_code,
-                response.text,
-            )
-        )
-
-    endpoint = _wait_for_service(user, func, ini_file=ini_file)
-
-    if host is not None:
-        endpoint_host = _endpoint_host(endpoint)
-
-        if endpoint_host != host and host not in str(endpoint):
-            raise RuntimeError(
-                "Expected {}/{} on host {}, discovered {}".format(
-                    user,
-                    func,
-                    host,
-                    endpoint,
-                )
-            )
-
-    print("          ready endpoint={}".format(endpoint))
-
-    return {
-        "user": user,
-        "func": func,
-        "app_id": app_id,
-        "group_id": group_id,
-        "msg_id": msg_id,
-        "endpoint": str(endpoint),
-        "host": host or "",
-    }
-
-
 def _shutdown_service_quietly(user, func, ini_file=None):
-    print("[cleanup] shutting down {}/{}...".format(user, func))
+    print("[cleanup] Shutting down {}/{}...".format(user, func))
 
     try:
         shutdown_service(user, func, ini_file=ini_file)
-        print("          shutdown request sent")
+        print("         Shutdown request sent.")
     except Exception as e:
-        print("          warning: {}".format(e))
+        print("         Warning: {}".format(e))
 
     _wait_for_service_gone(user, func, ini_file=ini_file)
 
 
 def _default_placements(source_host, dest_host, target_service):
     """
-    For clean UserService migration/restart experiments, isolate the target
-    service on source_host and place the rest of the SNB stack on dest_host.
-
-    This matters because SET_NEXT_EVICTED_VM evicts a host, not one service.
+    Isolate target_service on source_host, and put the rest of the SNB stack on
+    dest_host. This matters because SET_NEXT_EVICTED_VM evicts a host, not a
+    single service.
     """
     if source_host is None or dest_host is None:
         return {}
@@ -475,158 +446,216 @@ def _default_placements(source_host, dest_host, target_service):
     return placements
 
 
-def _start_snb_stack(
+def _start_service_once(
+    service_func,
+    ini_file=None,
+    service_host=None,
+):
+    print(
+        "[service] Starting {}/{} service...".format(
+            SERVICE_USER,
+            service_func,
+        )
+    )
+
+    app_id, group_id, msg_id = invoke_wasm_no_wait_placed(
+        SERVICE_USER,
+        service_func,
+        ini_file=ini_file,
+        host=service_host,
+    )
+
+    print(
+        "      appId={} groupId={} messageId={}".format(
+            app_id,
+            group_id,
+            msg_id,
+        )
+    )
+
+    print("      Polling until service is discoverable...")
+    endpoint = _wait_for_service(
+        SERVICE_USER,
+        service_func,
+        ini_file=ini_file,
+    )
+    print("      Service ready at {}".format(endpoint))
+
+    if service_host is not None:
+        endpoint_host = _endpoint_host(endpoint)
+
+        if endpoint_host != service_host and service_host not in str(endpoint):
+            raise RuntimeError(
+                "Expected {}/{} on host {}, but discovered endpoint is {}".format(
+                    SERVICE_USER,
+                    service_func,
+                    service_host,
+                    endpoint,
+                )
+            )
+
+    return {
+        "user": SERVICE_USER,
+        "function": service_func,
+        "app_id": app_id,
+        "group_id": group_id,
+        "msg_id": msg_id,
+        "host": service_host or "",
+        "endpoint": str(endpoint),
+    }
+
+
+def _start_service_stack(
     ini_file=None,
     num_workers=2,
     placements=None,
 ):
+    print("[1/6] Resetting planner and waiting for {} workers...".format(num_workers))
+    reset(expected_num_workers=num_workers, verbose=True)
+
+    print("[2/6] Setting scheduler policy to {}...".format(COMPOSE_MIGRATION_POLICY))
+    set_planner_policy(COMPOSE_MIGRATION_POLICY)
+
+    print("[3/6] Starting SNB services...")
+
     if placements is None:
         placements = {}
 
-    print("[1/6] resetting planner and waiting for {} workers...".format(num_workers))
-    reset(expected_num_workers=num_workers, verbose=True)
-
-    print("[2/6] setting scheduler policy to {}...".format(POLICY))
-    set_planner_policy(POLICY)
-
-    print("[3/6] starting SNB services...")
-
     started = {}
 
-    for func in SERVICES:
-        host = placements.get(func)
+    for service_func in SERVICES:
+        service_host = placements.get(service_func)
 
-        info = _start_service(
-            SERVICE_USER,
-            func,
-            host=host,
+        started[service_func] = _start_service_once(
+            service_func,
             ini_file=ini_file,
+            service_host=service_host,
         )
-
-        started[func] = info
 
     return started
 
 
-def _shutdown_snb_stack(ini_file=None):
-    for func in reversed(SERVICES):
-        _shutdown_service_quietly(SERVICE_USER, func, ini_file=ini_file)
+def _shutdown_service_stack(ini_file=None):
+    for service_func in reversed(SERVICES):
+        _shutdown_service_quietly(
+            SERVICE_USER,
+            service_func,
+            ini_file=ini_file,
+        )
 
-    print("[cleanup] quiescing for {}s...".format(SERVICE_QUIESCE_PERIOD_S))
+    print(
+        "         Quiescing for {}s before next reset...".format(
+            SERVICE_QUIESCE_PERIOD_S,
+        )
+    )
     sleep(SERVICE_QUIESCE_PERIOD_S)
 
 
-def _migrate_service_by_eviction(
-    service_info,
+def _trigger_live_migration(
+    target_info,
     source_host,
     dest_host,
     ini_file=None,
 ):
     """
-    Trigger live migration through the SPOT path.
+    Live migration scenario.
 
-    The service has already been started using a preloaded initial placement.
-    This function only evicts the source host and waits for the service
-    discovery entry to move.
+    The target service has already been started on source_host through an
+    initial preloaded scheduling decision. This event only evicts source_host
+    and waits for service discovery to move to dest_host.
     """
-    user = service_info["user"]
-    func = service_info["func"]
+    service_func = target_info["function"]
 
     print(
-        "[event] live migration by eviction: {}/{} "
-        "appId={} msgId={} {} -> {}".format(
-            user,
-            func,
-            service_info["app_id"],
-            service_info["msg_id"],
+        "[event] Live migration by eviction: {}/{} appId={} msgId={} {} -> {}".format(
+            SERVICE_USER,
+            service_func,
+            target_info["app_id"],
+            target_info["msg_id"],
             source_host,
             dest_host,
         )
     )
 
     event_start_s = time()
+    event_success = 0
+    endpoint = ""
 
     set_next_evicted_host([source_host])
 
-    endpoint = _wait_for_service_on_host(
-        user,
-        func,
+    moved_endpoint = _wait_for_service_on_host(
+        SERVICE_USER,
+        service_func,
         dest_host,
         ini_file=ini_file,
     )
 
+    endpoint = str(moved_endpoint)
+    event_success = 1
     event_end_s = time()
 
     return {
-        "event": "live_migration",
-        "service": func,
-        "app_id": service_info["app_id"],
-        "msg_id": service_info["msg_id"],
-        "source_host": source_host,
-        "dest_host": dest_host,
+        "event_success": event_success,
         "event_start_s": event_start_s,
         "event_end_s": event_end_s,
         "event_duration_s": event_end_s - event_start_s,
-        "endpoint": str(endpoint),
+        "event_endpoint": endpoint,
+        "target_app_id": target_info["app_id"],
+        "target_msg_id": target_info["msg_id"],
     }
 
 
-def _drain_restart_service(
-    service_func,
-    old_host=None,
-    new_host=None,
+def _trigger_drain_restart(
+    target_service,
+    source_host,
+    dest_host,
     ini_file=None,
 ):
     """
     Non-migrating baseline.
 
-    The old long-running service is shut down, waited for, and then a fresh
-    instance is started on the destination host.
+    Shut down the target service, wait for it to disappear from service
+    discovery, then start a fresh instance on dest_host.
     """
     print(
-        "[event] drain/restart {} old_host={} new_host={}".format(
-            service_func,
-            old_host or "",
-            new_host or "",
+        "[event] Drain/restart: {}/{} {} -> {}".format(
+            SERVICE_USER,
+            target_service,
+            source_host,
+            dest_host,
         )
     )
 
     event_start_s = time()
+    event_success = 0
 
-    shutdown_service(SERVICE_USER, service_func, ini_file=ini_file)
-    _wait_for_service_gone(SERVICE_USER, service_func, ini_file=ini_file)
+    shutdown_service(SERVICE_USER, target_service, ini_file=ini_file)
+    _wait_for_service_gone(SERVICE_USER, target_service, ini_file=ini_file)
 
-    event_mid_s = time()
-
-    restarted = _start_service(
-        SERVICE_USER,
-        service_func,
-        host=new_host,
+    restarted = _start_service_once(
+        target_service,
         ini_file=ini_file,
+        service_host=dest_host,
     )
 
+    event_success = 1
     event_end_s = time()
 
     return {
-        "event": "drain_restart",
-        "service": service_func,
-        "app_id": restarted["app_id"],
-        "msg_id": restarted["msg_id"],
-        "source_host": old_host or "",
-        "dest_host": new_host or "",
+        "event_success": event_success,
         "event_start_s": event_start_s,
-        "event_mid_s": event_mid_s,
         "event_end_s": event_end_s,
         "event_duration_s": event_end_s - event_start_s,
-        "restart_duration_s": event_end_s - event_mid_s,
-        "endpoint": restarted["endpoint"],
+        "event_endpoint": restarted["endpoint"],
+        "target_app_id": restarted["app_id"],
+        "target_msg_id": restarted["msg_id"],
     }
 
 
-def _run_compose_client_sync(
+def _run_client_once(
     ini_file=None,
     total_requests=1000,
-    concurrency=8,
+    concurrency=1,
     text_bytes=128,
     mention_count=2,
     url_count=1,
@@ -634,8 +663,31 @@ def _run_compose_client_sync(
     seed=1,
     warmup_requests=100,
     verify_storage=False,
+    source_host=None,
+    dest_host=None,
     client_host=None,
+    scenario="unknown",
+    target_service=TARGET_SERVICE,
+    repeat=0,
+    out_dir="compose_migration_results",
 ):
+    print(
+        "[client] scenario={} repeat={} total={} concurrency={} "
+        "text={} mentions={} urls={} users={} seed={} warmup={} verify={}".format(
+            scenario,
+            repeat,
+            total_requests,
+            concurrency,
+            text_bytes,
+            mention_count,
+            url_count,
+            user_count,
+            seed,
+            warmup_requests,
+            1 if _as_bool(verify_storage) else 0,
+        )
+    )
+
     cmdline = "{} {} {} {} {} {} {} {} {}".format(
         total_requests,
         concurrency,
@@ -645,19 +697,10 @@ def _run_compose_client_sync(
         user_count,
         seed,
         warmup_requests,
-        1 if verify_storage else 0,
+        1 if _as_bool(verify_storage) else 0,
     )
 
     host_list = [client_host] if client_host is not None else None
-
-    print(
-        "[client] invoking {}/{} cmdline='{}' host={}".format(
-            BENCHMARK_USER,
-            BENCHMARK_FUNC,
-            cmdline,
-            client_host or "",
-        )
-    )
 
     result = invoke_wasm(
         {
@@ -672,20 +715,72 @@ def _run_compose_client_sync(
     )
 
     message_result = result.messageResults[0]
+    output = _normalise_output(message_result.outputData)
+    ret_code = message_result.returnValue
 
-    return {
-        "return_code": message_result.returnValue,
-        "output": _normalise_output(message_result.outputData),
+    raw_path = os.path.join(
+        out_dir,
+        "raw",
+        "raw_{}_{}_c{}_r{}.csv".format(
+            scenario,
+            target_service,
+            concurrency,
+            repeat,
+        ),
+    )
+    _write_raw_csv(raw_path, output)
+    print("         Raw CSV written to {}".format(raw_path))
+
+    parsed = _parse_benchmark_csv(output)
+
+    result_row = {
+        "scenario": scenario,
+        "repeat": repeat,
+        "target_service": target_service,
+        "source_host": source_host or "",
+        "dest_host": dest_host or "",
+        "client_host": client_host or "",
+        "total_requests": total_requests,
+        "concurrency": concurrency,
+        "text_bytes": text_bytes,
+        "mention_count": mention_count,
+        "url_count": url_count,
+        "user_count": user_count,
+        "seed": seed,
+        "warmup_requests": warmup_requests,
+        "verify_storage": 1 if _as_bool(verify_storage) else 0,
+        "successes": parsed["successes"],
+        "failures": parsed["failures"],
+        "duration_ns": parsed["duration_ns"],
+        "throughput_rps": parsed["throughput_rps"],
+        "p50_ns": parsed["p50_ns"],
+        "p90_ns": parsed["p90_ns"],
+        "p99_ns": parsed["p99_ns"],
+        "p999_ns": parsed["p999_ns"],
+        "max_ns": parsed["max_ns"],
+        "return_code": ret_code,
     }
+
+    print(
+        "         successes={} failures={} throughput={:.2f} rps "
+        "p50={:.0f}ns p99={:.0f}ns p999={:.0f}ns".format(
+            parsed["successes"],
+            parsed["failures"],
+            parsed["throughput_rps"],
+            parsed["p50_ns"] or 0,
+            parsed["p99_ns"] or 0,
+            parsed["p999_ns"] or 0,
+        )
+    )
+
+    return result_row
 
 
 def run_once(
     ini_file=None,
     num_workers=2,
-    scenario="drain_restart",
-    repeat=0,
     total_requests=1000,
-    concurrency=8,
+    concurrency=1,
     text_bytes=128,
     mention_count=2,
     url_count=1,
@@ -694,31 +789,29 @@ def run_once(
     warmup_requests=100,
     verify_storage=False,
     trigger_after_s=3.0,
+    scenario="live_migration",
+    target_service=TARGET_SERVICE,
     source_host=None,
     dest_host=None,
     client_host=None,
-    target_service=TARGET_SERVICE,
+    repeat=0,
     out_dir="compose_migration_results",
 ):
     """
-    Run one ComposePost disruption benchmark.
+    Runs one ComposePost disruption benchmark.
 
-    Scenarios:
-      - none:
-          start stack, run benchmark, no disruption
-      - live_migration:
-          start target service on source_host, start other services on dest_host,
-          run benchmark, evict source_host, wait for service discovery on dest_host
-      - drain_restart:
-          start target service on source_host, start other services on dest_host,
-          run benchmark, shutdown target service, restart it on dest_host
+    Lifecycle:
+      reset planner
+      start SNB service stack
+      invoke benchmark client in the background
+      trigger migration/drain event while client is running
+      collect benchmark result
+      shutdown services
+      wait for stale async planner messages to settle
     """
-    scenario = str(scenario)
-
-    print("=== SNB ComposePost disruption benchmark ===")
+    print("=== ComposePost Migration Benchmark ===")
     print(
-        "scenario={} repeat={} target={} total={} concurrency={} "
-        "trigger_after={}s".format(
+        "scenario={} repeat={} target={} total={} concurrency={} trigger={}s".format(
             scenario,
             repeat,
             target_service,
@@ -729,9 +822,9 @@ def run_once(
     )
     print(
         "source_host={} dest_host={} client_host={}".format(
-            source_host or "",
-            dest_host or "",
-            client_host or "",
+            source_host,
+            dest_host,
+            client_host,
         )
     )
 
@@ -746,181 +839,126 @@ def run_once(
                 "{} requires source_host != dest_host".format(scenario)
             )
 
+    result_row = None
+
+    event_info = {
+        "event_success": 1 if scenario == "none" else 0,
+        "event_start_s": 0,
+        "event_end_s": 0,
+        "event_duration_s": 0,
+        "event_endpoint": "",
+        "target_app_id": "",
+        "target_msg_id": "",
+    }
+
     placements = _default_placements(
         source_host=source_host,
         dest_host=dest_host,
         target_service=target_service,
     )
 
-    started = None
-    client_result = None
-    event_info = {
-        "event": "none",
-        "event_duration_s": 0.0,
-        "event_start_s": 0.0,
-        "event_end_s": 0.0,
-        "endpoint": "",
-        "app_id": "",
-        "msg_id": "",
-    }
-
     try:
-        started = _start_snb_stack(
+        started = _start_service_stack(
             ini_file=ini_file,
-            num_workers=int(num_workers),
+            num_workers=num_workers,
             placements=placements,
         )
 
         if target_service not in started:
-            raise RuntimeError(
-                "Target service {} was not started".format(target_service)
-            )
+            raise RuntimeError("Target service {} was not started".format(target_service))
 
-        print("[4/6] starting benchmark client in background...")
+        target_info = started[target_service]
+
+        print("[4/6] Invoking benchmark client in background...")
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
-                _run_compose_client_sync,
+                _run_client_once,
                 ini_file,
-                int(total_requests),
-                int(concurrency),
-                int(text_bytes),
-                int(mention_count),
-                int(url_count),
-                int(user_count),
-                int(seed),
-                int(warmup_requests),
-                _as_bool(verify_storage),
+                total_requests,
+                concurrency,
+                text_bytes,
+                mention_count,
+                url_count,
+                user_count,
+                seed,
+                verify_storage,
+                source_host,
+                dest_host,
                 client_host,
+                scenario,
+                target_service,
+                repeat,
+                out_dir,
             )
 
-            print("[5/6] waiting {}s before event...".format(trigger_after_s))
+            print("[5/6] Waiting {}s before event...".format(trigger_after_s))
             sleep(float(trigger_after_s))
 
             if scenario == "live_migration":
-                event_info = _migrate_service_by_eviction(
-                    started[target_service],
+                event_info = _trigger_live_migration(
+                    target_info,
                     source_host=source_host,
                     dest_host=dest_host,
                     ini_file=ini_file,
                 )
             elif scenario == "drain_restart":
-                event_info = _drain_restart_service(
+                event_info = _trigger_drain_restart(
                     target_service,
-                    old_host=source_host,
-                    new_host=dest_host,
+                    source_host=source_host,
+                    dest_host=dest_host,
                     ini_file=ini_file,
                 )
             elif scenario == "none":
-                event_start_s = time()
                 event_info = {
-                    "event": "none",
-                    "service": target_service,
-                    "app_id": started[target_service]["app_id"],
-                    "msg_id": started[target_service]["msg_id"],
-                    "source_host": source_host or "",
-                    "dest_host": dest_host or "",
-                    "event_start_s": event_start_s,
-                    "event_end_s": event_start_s,
-                    "event_duration_s": 0.0,
-                    "endpoint": started[target_service]["endpoint"],
+                    "event_success": 1,
+                    "event_start_s": time(),
+                    "event_end_s": time(),
+                    "event_duration_s": 0,
+                    "event_endpoint": target_info["endpoint"],
+                    "target_app_id": target_info["app_id"],
+                    "target_msg_id": target_info["msg_id"],
                 }
             else:
                 raise ValueError("Unsupported scenario: {}".format(scenario))
 
-            print("[6/6] waiting for benchmark client result...")
-            client_result = future.result()
+            print("[6/6] Waiting for benchmark client...")
+            result_row = future.result()
 
-        output = client_result["output"]
-        return_code = client_result["return_code"]
-
-        raw_path = os.path.join(
-            out_dir,
-            "raw",
-            "raw_{}_{}_c{}_r{}.csv".format(
-                scenario,
-                target_service,
-                concurrency,
-                repeat,
-            ),
+        result_row.update(
+            {
+                "trigger_after_s": float(trigger_after_s),
+                "event_start_rel_ns_approx": int(float(trigger_after_s) * 1e9),
+                "event_success": int(event_info["event_success"]),
+                "event_duration_s": event_info["event_duration_s"],
+                "event_endpoint": event_info["event_endpoint"],
+                "target_app_id": event_info["target_app_id"],
+                "target_msg_id": event_info["target_msg_id"],
+                "zero_failures": 1 if int(result_row["failures"]) == 0 else 0,
+                # This means the harness/event/client completed. Per-request
+                # failures are reported separately.
+                "success": 1
+                if int(result_row["return_code"]) == 0
+                and int(event_info["event_success"]) == 1
+                else 0,
+            }
         )
-        _write_raw_csv(raw_path, output)
-        print("      raw CSV written to {}".format(raw_path))
-
-        parsed = _parse_compose_csv(output)
-
-        summary_row = {
-            "scenario": scenario,
-            "repeat": repeat,
-            "target_service": target_service,
-            "source_host": source_host or "",
-            "dest_host": dest_host or "",
-            "client_host": client_host or "",
-            "trigger_after_s": float(trigger_after_s),
-            "event_start_rel_ns_approx": int(float(trigger_after_s) * 1e9),
-            "event_duration_s": event_info.get("event_duration_s", 0.0),
-            "event_start_s": event_info.get("event_start_s", 0.0),
-            "event_end_s": event_info.get("event_end_s", 0.0),
-            "event_endpoint": event_info.get("endpoint", ""),
-            "target_app_id": event_info.get(
-                "app_id",
-                started[target_service]["app_id"],
-            ),
-            "target_msg_id": event_info.get(
-                "msg_id",
-                started[target_service]["msg_id"],
-            ),
-            "total_requests": int(total_requests),
-            "concurrency": int(concurrency),
-            "text_bytes": int(text_bytes),
-            "mention_count": int(mention_count),
-            "url_count": int(url_count),
-            "user_count": int(user_count),
-            "seed": int(seed),
-            "warmup_requests": int(warmup_requests),
-            "verify_storage": 1 if _as_bool(verify_storage) else 0,
-            "successes": parsed["successes"],
-            "failures": parsed["failures"],
-            "duration_ns": parsed["duration_ns"],
-            "throughput_rps": parsed["throughput_rps"],
-            "p50_ns": parsed["p50_ns"],
-            "p90_ns": parsed["p90_ns"],
-            "p99_ns": parsed["p99_ns"],
-            "p999_ns": parsed["p999_ns"],
-            "max_ns": parsed["max_ns"],
-            "return_code": return_code,
-        }
 
         summary_path = os.path.join(out_dir, "summary.csv")
-        _append_summary_csv(summary_path, summary_row)
-        print("      summary appended to {}".format(summary_path))
-
-        print(
-            "      successes={} failures={} throughput={:.2f} rps "
-            "p50={:.0f}ns p99={:.0f}ns max={:.0f}ns return_code={}".format(
-                parsed["successes"],
-                parsed["failures"],
-                parsed["throughput_rps"],
-                parsed["p50_ns"] or 0,
-                parsed["p99_ns"] or 0,
-                parsed["max_ns"] or 0,
-                return_code,
-            )
-        )
-
-        return summary_row
+        _append_summary_csv(summary_path, result_row)
+        print("         Summary appended to {}".format(summary_path))
 
     finally:
-        _shutdown_snb_stack(ini_file=ini_file)
+        _shutdown_service_stack(ini_file=ini_file)
+
+    return result_row
 
 
 def run_sweep(
     ini_file=None,
     num_workers=2,
-    scenario="drain_restart",
-    repeats=3,
     total_requests=1000,
-    concurrencies=(1, 2, 4, 8, 16),
+    concurrencies=(1, 2, 4, 8, 16, 32),
     text_bytes=128,
     mention_count=2,
     url_count=1,
@@ -929,21 +967,50 @@ def run_sweep(
     warmup_requests=100,
     verify_storage=False,
     trigger_after_s=3.0,
+    scenario="live_migration",
+    target_service=TARGET_SERVICE,
     source_host=None,
     dest_host=None,
     client_host=None,
-    target_service=TARGET_SERVICE,
+    repeats=1,
     out_dir="compose_migration_results",
 ):
+    """
+    Runs the concurrency sweep for one scenario.
+
+    Scenarios:
+      none:
+        no disruption event
+      live_migration:
+        evict source_host and wait for target_service to migrate to dest_host
+      drain_restart:
+        shutdown target_service and start a fresh instance on dest_host
+    """
     rows = []
+
+    print("=== ComposePost Migration Benchmark Sweep ===")
+    print(
+        "scenario={} target={} total={} concurrencies={} repeats={}".format(
+            scenario,
+            target_service,
+            total_requests,
+            concurrencies,
+            repeats,
+        )
+    )
+    print(
+        "source_host={} dest_host={} client_host={}".format(
+            source_host,
+            dest_host,
+            client_host,
+        )
+    )
 
     for concurrency in concurrencies:
         for repeat in range(int(repeats)):
             row = run_once(
                 ini_file=ini_file,
                 num_workers=int(num_workers),
-                scenario=scenario,
-                repeat=repeat,
                 total_requests=int(total_requests),
                 concurrency=int(concurrency),
                 text_bytes=int(text_bytes),
@@ -954,13 +1021,14 @@ def run_sweep(
                 warmup_requests=int(warmup_requests),
                 verify_storage=_as_bool(verify_storage),
                 trigger_after_s=float(trigger_after_s),
+                scenario=scenario,
+                target_service=target_service,
                 source_host=source_host,
                 dest_host=dest_host,
                 client_host=client_host,
-                target_service=target_service,
+                repeat=repeat,
                 out_dir=out_dir,
             )
-
             rows.append(row)
 
     return rows
@@ -969,10 +1037,8 @@ def run_sweep(
 def run(
     ini_file=None,
     num_workers=2,
-    scenario="drain_restart",
-    repeats=3,
     total_requests=1000,
-    concurrencies="1,2,4,8,16",
+    concurrencies="1,2,4,8,16,32",
     text_bytes=128,
     mention_count=2,
     url_count=1,
@@ -981,18 +1047,19 @@ def run(
     warmup_requests=100,
     verify_storage=False,
     trigger_after_s=3.0,
+    scenario="live_migration",
+    target_service=TARGET_SERVICE,
     source_host=None,
     dest_host=None,
     client_host=None,
-    target_service=TARGET_SERVICE,
+    repeats=1,
     out_dir="compose_migration_results",
 ):
     """
-    Entry point used by experiment runner.
+    Entry point used by `inv experiment.run compose-migration`.
 
-    Returns True if the harness completed and the benchmark functions returned
-    zero. Per-request failures are not treated as harness failures because they
-    are a measured outcome for drain/restart.
+    Returns True if all runs completed successfully at the harness level.
+    Per-request RPC failures are still recorded in summary.csv.
     """
     if isinstance(concurrencies, str):
         concurrencies = tuple(
@@ -1001,11 +1068,20 @@ def run(
             if x.strip()
         )
 
+    if scenario in ("live_migration", "drain_restart"):
+        if source_host is None or dest_host is None:
+            raise ValueError(
+                "{} requires source_host and dest_host".format(scenario)
+            )
+
+        if source_host == dest_host:
+            raise ValueError(
+                "{} requires source_host != dest_host".format(scenario)
+            )
+
     rows = run_sweep(
         ini_file=ini_file,
         num_workers=int(num_workers),
-        scenario=scenario,
-        repeats=int(repeats),
         total_requests=int(total_requests),
         concurrencies=concurrencies,
         text_bytes=int(text_bytes),
@@ -1016,10 +1092,12 @@ def run(
         warmup_requests=int(warmup_requests),
         verify_storage=_as_bool(verify_storage),
         trigger_after_s=float(trigger_after_s),
+        scenario=scenario,
+        target_service=target_service,
         source_host=source_host,
         dest_host=dest_host,
         client_host=client_host,
-        target_service=target_service,
+        repeats=int(repeats),
         out_dir=out_dir,
     )
 
@@ -1028,7 +1106,7 @@ def run(
     for row in rows:
         if row is None:
             ok = False
-        elif int(row["return_code"]) != 0:
+        elif int(row["success"]) != 1:
             ok = False
 
     return ok

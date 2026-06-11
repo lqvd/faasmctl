@@ -4,6 +4,9 @@ from faasmctl.experiments.correctness import (
 from faasmctl.experiments.steady_state import (
     run as run_steady_state,
 )
+from faasmctl.experiments.compose_migration import (
+    run as run_compose_migration,
+)
 
 from invoke import task
 from sys import exit
@@ -12,8 +15,8 @@ from sys import exit
 EXPERIMENTS = {
     "migration-correctness": run_migration_correctness,
     "steady-state": run_steady_state,
+    "compose-migration": run_compose_migration,
 }
-
 
 @task(name="list")
 def list_experiments(ctx):
@@ -30,6 +33,8 @@ def run(
     ini_file=None,
     fan_out=4,
     num_workers=2,
+
+    # Common / steady-state
     total_requests=1000,
     concurrencies="1,2,4,8,16,32,64",
     payload_bytes=64,
@@ -39,6 +44,20 @@ def run(
     client_host=None,
     placement="unknown",
     out_dir="steady_state_results",
+
+    # ComposePost migration
+    scenario="live_migration",
+    target_service="UserService",
+    source_host=None,
+    dest_host=None,
+    text_bytes=128,
+    mention_count=2,
+    url_count=1,
+    user_count=100,
+    seed=1,
+    warmup_requests=100,
+    verify_storage=False,
+    trigger_after_s=3.0,
 ):
     """
     Run a named experiment.
@@ -59,8 +78,8 @@ def run(
         --placement remote \
         --service-host 10.0.0.10 \
         --client-host 10.0.0.11 \
-        --total-requests 1000 \
-        --concurrencies 1,2,4,8,16,32,64 \
+        --total-requests 5000 \
+        --concurrencies 64 \
         --repeats 3
     """
     if name not in EXPERIMENTS:
@@ -88,6 +107,28 @@ def run(
             service_host=service_host,
             client_host=client_host,
             placement=placement,
+            out_dir=out_dir,
+        )
+    elif name == "compose-migration":
+        success = EXPERIMENTS[name](
+            ini_file=ini_file,
+            num_workers=int(num_workers),
+            total_requests=int(total_requests),
+            concurrencies=concurrencies,
+            text_bytes=int(text_bytes),
+            mention_count=int(mention_count),
+            url_count=int(url_count),
+            user_count=int(user_count),
+            seed=int(seed),
+            warmup_requests=int(warmup_requests),
+            verify_storage=verify_storage,
+            trigger_after_s=float(trigger_after_s),
+            scenario=scenario,
+            target_service=target_service,
+            source_host=source_host,
+            dest_host=dest_host,
+            client_host=client_host,
+            repeats=int(repeats),
             out_dir=out_dir,
         )
     else:
