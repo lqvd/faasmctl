@@ -4,7 +4,7 @@ from faasmctl.experiments.correctness import (
 from faasmctl.experiments.steady_state import (
     run as run_steady_state,
 )
-from faasmctl.experiments.compose_migration import (
+from faasmctl.experiments.migration import (
     run as run_compose_migration,
 )
 
