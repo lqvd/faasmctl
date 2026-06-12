@@ -49,8 +49,36 @@ LOCALITY_STATIC_POLICY = "spot"
 # Policy under test.
 LOCALITY_POLICY = "service"
 
-LOCALITY_SCENARIOS = ("static_bad", "static_good", "policy")
+LOCALITY_SCENARIOS = (
+    "static_bad",
+    "static_good",
+    "policy",
+    "policy_settled",
+)
 
+def _policy_settled_placements(roles):
+    """
+    Placement derived from the best converged policy run.
+
+    This uses two hosts:
+      - client_host: benchmark client and UserDbService
+      - aux_host: ComposePostService, UserService, TextService,
+        UniqueIdService, and PostStorageService
+
+    This matches the observed policy placement where the policy colocated the
+    main ComposePost fan-out services with UserService.
+    """
+    cluster_host = roles["aux_host"]
+    db_host = roles["client_host"]
+
+    return {
+        "UserDbService": db_host,
+        "ComposePostService": cluster_host,
+        "UserService": cluster_host,
+        "TextService": cluster_host,
+        "UniqueIdService": cluster_host,
+        "PostStorageService": cluster_host,
+    }
 
 def _as_bool(value):
     if isinstance(value, bool):
@@ -321,29 +349,26 @@ def _locality_placements(scenario, roles):
     """
     Four-worker placement design:
 
-      compose_host:
-        ComposePostService
-        benchmark client also runs here
+      static_bad:
+        UserService starts on bad_host.
 
-      affinity_host:
-        UserDbService
-        UserService in static_good
+      static_good:
+        UserService starts on affinity_host with UserDbService.
 
-      bad_host:
-        UserService initially, for static_bad and policy
+      policy:
+        Starts from static_bad, then enables the online service-locality
+        scheduler and runs a telemetry warmup.
 
-      aux_host:
-        TextService
-        UniqueIdService
-        PostStorageService
-
-    The policy case starts in the same placement as static_bad. The scheduler is
-    then allowed to move services according to its own RPC dependency graph.
-    The harness observes the final placement rather than asserting a particular
-    destination.
+      policy_settled:
+        Starts from a policy-derived final placement observed in the online
+        policy runs. This excludes adaptation cost and measures the quality of
+        the placement selected by the policy.
     """
     if scenario not in LOCALITY_SCENARIOS:
         raise ValueError("Unsupported locality scenario: {}".format(scenario))
+
+    if scenario == "policy_settled":
+        return _policy_settled_placements(roles)
 
     placements = {
         "ComposePostService": roles["compose_host"],
@@ -897,6 +922,13 @@ def run_once(
         generates RPC dependency telemetry. The measured benchmark then runs
         without forcing, waiting for, or asserting any specific migration. Final
         placements are observed before cleanup.
+
+      policy_settled:
+        Services start from a policy-derived final placement observed in the
+        online policy runs. The service-locality policy is enabled, but no
+        telemetry warmup is run before measurement. This tests whether the
+        policy-derived placement is stable and whether it approaches the
+        manually good placement once adaptation cost is excluded.
     """
     if scenario not in LOCALITY_SCENARIOS:
         raise ValueError(
@@ -955,11 +987,12 @@ def run_once(
             {},
         ).get("host", "")
 
-        if scenario == "policy":
+        if scenario in ("policy", "policy_settled"):
             print("[4/5] Enabling locality scheduler policy...")
             set_planner_policy(LOCALITY_POLICY)
             sleep(0.5)
 
+        if scenario == "policy":
             print("[4/5] Running policy warmup before measured benchmark...")
 
             telemetry_row = _run_client_once(
