@@ -246,7 +246,16 @@ def invoke_wasm_no_wait_placed(
     the long-running service starts on a specific worker.
 
     Returns:
-      (app_id, group_id, message_id)
+      {
+        "app_id": int,
+        "group_id": int,
+        "msg_id": int,
+        "req": BatchExecuteRequest
+      }
+
+    The returned request is the same logical service request sent to the
+    planner. For live migration, the harness mutates this same request to
+    preload the migration destination before evicting the source host.
     """
     req_dict = {
         "user": user,
@@ -308,7 +317,46 @@ def invoke_wasm_no_wait_placed(
             )
         )
 
-    return app_id, group_id, msg_id
+    return {
+        "app_id": app_id,
+        "group_id": group_id,
+        "msg_id": msg_id,
+        "req": req,
+    }
+
+
+def _preload_existing_service_destination(target_info, dest_host, ini_file=None):
+    """
+    Preload the migration destination for an existing long-running service.
+
+    This reuses the original BatchExecuteRequest identity. It does not create a
+    fresh logical service request.
+    """
+    req = target_info["req"]
+
+    req.messages[0].groupIdx = 0
+    req.messages[0].executedHost = dest_host
+
+    preload_msg = prepare_planner_msg(
+        "PRELOAD_SCHEDULING_DECISION",
+        MessageToJson(req, indent=None),
+    )
+
+    response = post(_planner_url(ini_file=ini_file), data=preload_msg, timeout=None)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Error preloading migration destination for {}/{} "
+            "appId={} msgId={} dest_host={} (code={}): {}".format(
+                SERVICE_USER,
+                target_info["function"],
+                target_info["app_id"],
+                target_info["msg_id"],
+                dest_host,
+                response.status_code,
+                response.text,
+            )
+        )
 
 
 def _wait_for_service(user, func, ini_file=None):
@@ -367,50 +415,41 @@ def _wait_for_service_gone(user, func, ini_file=None):
     )
 
 
-def _wait_for_service_on_host(user, func, expected_host, ini_file=None):
+def _wait_for_service_moved_from(user, func, source_host, ini_file=None):
     deadline = time() + SERVICE_MOVE_TIMEOUT_S
 
     while time() < deadline:
         endpoint = discover_service(user, func, ini_file=ini_file)
         endpoint_host = _endpoint_host(endpoint)
 
-        if endpoint is not None and endpoint_host == expected_host:
-            print(
-                "         {}/{} now discoverable at {}".format(
-                    user,
-                    func,
-                    endpoint,
+        if endpoint is not None and endpoint_host is not None:
+            if endpoint_host != source_host:
+                print(
+                    "         {}/{} moved from {} to {}".format(
+                        user,
+                        func,
+                        source_host,
+                        endpoint,
+                    )
                 )
-            )
-            return endpoint
-
-        # Fallback for endpoint string representations.
-        if endpoint is not None and expected_host in str(endpoint):
-            print(
-                "         {}/{} now discoverable at {}".format(
-                    user,
-                    func,
-                    endpoint,
-                )
-            )
-            return endpoint
+                return endpoint
 
         print(
-            "         Waiting for {}/{} to move to {} "
+            "         Waiting for {}/{} to move away from {} "
             "(current endpoint={})...".format(
                 user,
                 func,
-                expected_host,
+                source_host,
                 endpoint,
             )
         )
         sleep(DISCOVER_POLL_PERIOD_S)
 
     raise RuntimeError(
-        "Timed out waiting for {}/{} to move to {}".format(
+        "Timed out waiting for {}/{} to move away from {}".format(
             user,
             func,
-            expected_host,
+            source_host,
         )
     )
 
@@ -458,12 +497,16 @@ def _start_service_once(
         )
     )
 
-    app_id, group_id, msg_id = invoke_wasm_no_wait_placed(
+    start_info = invoke_wasm_no_wait_placed(
         SERVICE_USER,
         service_func,
         ini_file=ini_file,
         host=service_host,
     )
+
+    app_id = start_info["app_id"]
+    group_id = start_info["group_id"]
+    msg_id = start_info["msg_id"]
 
     print(
         "      appId={} groupId={} messageId={}".format(
@@ -502,6 +545,7 @@ def _start_service_once(
         "msg_id": msg_id,
         "host": service_host or "",
         "endpoint": str(endpoint),
+        "req": start_info["req"],
     }
 
 
@@ -557,13 +601,6 @@ def _trigger_live_migration(
     dest_host,
     ini_file=None,
 ):
-    """
-    Live migration scenario.
-
-    The target service has already been started on source_host through an
-    initial preloaded scheduling decision. This event only evicts source_host
-    and waits for service discovery to move to dest_host.
-    """
     service_func = target_info["function"]
 
     print(
@@ -581,12 +618,24 @@ def _trigger_live_migration(
     event_success = 0
     endpoint = ""
 
+    # Be explicit. Some other path may have reset or overwritten the policy.
+    set_planner_policy(COMPOSE_MIGRATION_POLICY)
+    sleep(0.5)
+
+    # Force the destination for the same logical service request. Without this,
+    # SPOT may choose any non-evicted worker.
+    _preload_existing_service_destination(
+        target_info,
+        dest_host,
+        ini_file=ini_file,
+    )
+
     set_next_evicted_host([source_host])
 
-    moved_endpoint = _wait_for_service_on_host(
+    moved_endpoint = _wait_for_service_moved_from(
         SERVICE_USER,
         service_func,
-        dest_host,
+        source_host,
         ini_file=ini_file,
     )
 
@@ -728,10 +777,13 @@ def _run_client_once(
             repeat,
         ),
     )
+    raw_path = os.path.join(out_dir, "raw", "raw_{}_{}_c{}_r{}.csv".format(
+        scenario, target_service, concurrency, repeat))
     _write_raw_csv(raw_path, output)
-    print("         Raw CSV written to {}".format(raw_path))
+    print("         return_code={} output_len={}".format(ret_code, len(output)))
+    print("         output head: {!r}".format(output[:300]))
 
-    parsed = _parse_benchmark_csv(output)
+    parsed = _parse_benchmark_csv(output)   # now after the raw dump
 
     result_row = {
         "scenario": scenario,
@@ -865,7 +917,9 @@ def run_once(
         )
 
         if target_service not in started:
-            raise RuntimeError("Target service {} was not started".format(target_service))
+            raise RuntimeError(
+                "Target service {} was not started".format(target_service)
+            )
 
         target_info = started[target_service]
 
@@ -874,22 +928,23 @@ def run_once(
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
                 _run_client_once,
-                ini_file,
-                total_requests,
-                concurrency,
-                text_bytes,
-                mention_count,
-                url_count,
-                user_count,
-                seed,
-                verify_storage,
-                source_host,
-                dest_host,
-                client_host,
-                scenario,
-                target_service,
-                repeat,
-                out_dir,
+                ini_file=ini_file,
+                total_requests=int(total_requests),
+                concurrency=int(concurrency),
+                text_bytes=int(text_bytes),
+                mention_count=int(mention_count),
+                url_count=int(url_count),
+                user_count=int(user_count),
+                seed=int(seed),
+                warmup_requests=int(warmup_requests),
+                verify_storage=_as_bool(verify_storage),
+                source_host=source_host,
+                dest_host=dest_host,
+                client_host=client_host,
+                scenario=scenario,
+                target_service=target_service,
+                repeat=repeat,
+                out_dir=out_dir,
             )
 
             print("[5/6] Waiting {}s before event...".format(trigger_after_s))
