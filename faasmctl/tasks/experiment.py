@@ -7,9 +7,9 @@ from faasmctl.experiments.steady_state import (
 from faasmctl.experiments.migration import (
     run as run_compose_migration,
 )
-from faasmctl.experiments.locality import {
+from faasmctl.experiments.locality import (
     run as run_compose_locality,
-}
+)
 
 from invoke import task
 from sys import exit
