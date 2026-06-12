@@ -7,6 +7,9 @@ from faasmctl.experiments.steady_state import (
 from faasmctl.experiments.migration import (
     run as run_compose_migration,
 )
+from faasmctl.experiments.locality import {
+    run as run_compose_locality,
+}
 
 from invoke import task
 from sys import exit
@@ -16,6 +19,7 @@ EXPERIMENTS = {
     "migration-correctness": run_migration_correctness,
     "steady-state": run_steady_state,
     "compose-migration": run_compose_migration,
+    "compose-locality": run_compose_locality,
 }
 
 @task(name="list")
@@ -58,6 +62,11 @@ def run(
     warmup_requests=100,
     verify_storage=False,
     trigger_after_s=3.0,
+
+    # ComposePost locality
+    worker_hosts=None,
+    policy_warmup_requests=1000,
+    policy_warmup_concurrency=4,
 ):
     """
     Run a named experiment.
@@ -128,6 +137,27 @@ def run(
             source_host=source_host,
             dest_host=dest_host,
             client_host=client_host,
+            repeats=int(repeats),
+            out_dir=out_dir,
+        )
+    elif name == "compose-locality":
+        success = EXPERIMENTS[name](
+            ini_file=ini_file,
+            worker_hosts=worker_hosts,
+            num_workers=int(num_workers),
+            scenario=scenario,
+            target_service=target_service,
+            total_requests=int(total_requests),
+            concurrencies=concurrencies,
+            text_bytes=int(text_bytes),
+            mention_count=int(mention_count),
+            url_count=int(url_count),
+            user_count=int(user_count),
+            seed=int(seed),
+            warmup_requests=int(warmup_requests),
+            verify_storage=verify_storage,
+            telemetry_requests=int(policy_warmup_requests),
+            telemetry_concurrency=int(policy_warmup_concurrency),
             repeats=int(repeats),
             out_dir=out_dir,
         )
