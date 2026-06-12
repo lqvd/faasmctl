@@ -2,7 +2,7 @@ from faasmctl.util.config import get_faasm_ini_file, get_faasm_planner_host_port
 from faasmctl.util.gen_proto.planner_pb2 import (
     AvailableHostsResponse,
     DiscoverServiceResponse,
-    DiscoverServiceRequest,
+    ServiceReadyNotification,
     GetInFlightAppsResponse,
     HttpMessage,
     SetEvictedVmIpsRequest,
@@ -233,7 +233,7 @@ def shutdown_service(user, func, ini_file=None):
     host, port = get_faasm_planner_host_port(ini_file)
     url = "http://{}:{}".format(host, port)
 
-    req = DiscoverServiceRequest()
+    req = ServiceReadyNotification()
     req.serviceName = "{}/{}".format(user, func)
     planner_msg = prepare_planner_msg(
         "SHUTDOWN_SERVICE", MessageToJson(req, indent=None)

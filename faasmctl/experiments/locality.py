@@ -14,7 +14,6 @@ from faasmctl.util.planner import (
     discover_service,
     prepare_planner_msg,
     reset,
-    set_next_evicted_host,
     set_planner_policy,
     shutdown_service,
 )
@@ -41,11 +40,10 @@ BENCHMARK_FUNC = "benchmark_snb"
 DISCOVER_POLL_PERIOD_S = 2
 SERVICE_QUIESCE_PERIOD_S = 5
 SERVICE_STOP_TIMEOUT_S = 30
-SERVICE_MOVE_TIMEOUT_S = 120
 
-# Policy used for fixed placement / warmup. Preloaded decisions still force the
-# exact placement, but using spot avoids the service policy interfering before
-# the policy event.
+# Policy used for fixed placement. Preloaded decisions still force the exact
+# placement, but using spot avoids the service policy interfering before the
+# policy experiment begins.
 LOCALITY_STATIC_POLICY = "spot"
 
 # Policy under test.
@@ -82,6 +80,25 @@ def _endpoint_host(endpoint):
         return endpoint.host
 
     return str(endpoint)
+
+
+def _endpoint_field(endpoint, *names):
+    if endpoint is None:
+        return ""
+
+    for name in names:
+        if hasattr(endpoint, name):
+            value = getattr(endpoint, name)
+
+            if callable(value):
+                try:
+                    return value()
+                except TypeError:
+                    pass
+            else:
+                return value
+
+    return ""
 
 
 def _percentile(values, q):
@@ -184,22 +201,27 @@ def _append_summary_csv(path, row):
         "target_service",
 
         "client_host",
+        "compose_host",
         "affinity_host",
         "bad_host",
         "aux_host",
 
         "initial_endpoint",
         "final_endpoint",
-        "event_success",
-        "event_duration_s",
-        "moved_host",
-        "moved_to_expected",
+        "initial_target_host",
+        "final_target_host",
+        "target_moved",
+        "target_colocated_with_compose",
+        "target_colocated_with_userdb",
+        "target_colocated_services",
+        "placement_summary",
+
         "target_app_id",
         "target_msg_id",
 
-        "telemetry_requests",
-        "telemetry_successes",
-        "telemetry_failures",
+        "policy_warmup_requests",
+        "policy_warmup_successes",
+        "policy_warmup_failures",
 
         "total_requests",
         "concurrency",
@@ -252,12 +274,13 @@ def _parse_worker_hosts(worker_hosts):
     """
     Expected order:
       worker_hosts[0] = client host and ComposePostService host
-      worker_hosts[1] = affinity/good host for UserDbService
+      worker_hosts[1] = manually good/affinity host
       worker_hosts[2] = bad initial UserService host
       worker_hosts[3] = auxiliary services host
 
-    With four total workers, the benchmark client is not isolated. It runs on
-    worker_hosts[0], which also hosts ComposePostService.
+    The policy scenario does not assume that the scheduler must move to any
+    specific host. These roles are used only to construct static baselines and
+    to interpret the observed placement afterwards.
     """
     if isinstance(worker_hosts, str):
         hosts = tuple(
@@ -304,7 +327,7 @@ def _locality_placements(scenario, roles):
 
       affinity_host:
         UserDbService
-        UserService after successful policy migration
+        UserService in static_good
 
       bad_host:
         UserService initially, for static_bad and policy
@@ -314,8 +337,10 @@ def _locality_placements(scenario, roles):
         UniqueIdService
         PostStorageService
 
-    The expected policy decision is to migrate UserService from bad_host to
-    affinity_host after observing the UserService -> UserDbService dependency.
+    The policy case starts in the same placement as static_bad. The scheduler is
+    then allowed to move services according to its own RPC dependency graph.
+    The harness observes the final placement rather than asserting a particular
+    destination.
     """
     if scenario not in LOCALITY_SCENARIOS:
         raise ValueError("Unsupported locality scenario: {}".format(scenario))
@@ -468,45 +493,6 @@ def _wait_for_service_gone(user, func, ini_file=None):
     )
 
 
-def _wait_for_service_moved_from(user, func, source_host, ini_file=None):
-    deadline = time() + SERVICE_MOVE_TIMEOUT_S
-
-    while time() < deadline:
-        endpoint = discover_service(user, func, ini_file=ini_file)
-        endpoint_host = _endpoint_host(endpoint)
-
-        if endpoint is not None and endpoint_host is not None:
-            if endpoint_host != source_host:
-                print(
-                    "         {}/{} moved from {} to {}".format(
-                        user,
-                        func,
-                        source_host,
-                        endpoint,
-                    )
-                )
-                return endpoint
-
-        print(
-            "         Waiting for {}/{} to move away from {} "
-            "(current endpoint={})...".format(
-                user,
-                func,
-                source_host,
-                endpoint,
-            )
-        )
-        sleep(DISCOVER_POLL_PERIOD_S)
-
-    raise RuntimeError(
-        "Timed out waiting for {}/{} to move away from {}".format(
-            user,
-            func,
-            source_host,
-        )
-    )
-
-
 def _shutdown_service_quietly(user, func, ini_file=None):
     print("[cleanup] Shutting down {}/{}...".format(user, func))
 
@@ -630,85 +616,125 @@ def _shutdown_service_stack(ini_file=None):
     sleep(SERVICE_QUIESCE_PERIOD_S)
 
 
-def _trigger_locality_policy_migration(
-    target_info,
-    source_host,
-    expected_host,
+def _observe_service_placements(
+    label,
     ini_file=None,
+    services=SERVICES,
 ):
     """
-    Trigger migration and let the service locality scheduler choose the
-    destination.
+    Print and return current service discovery placements.
 
-    This deliberately does not preload a destination. If the scheduler is
-    working, it should choose expected_host based on collected RPC telemetry.
+    This is observational only. It does not wait for convergence, migrate
+    services, evict workers, or enforce an expected placement.
     """
-    service_func = target_info["function"]
-
+    print("")
+    print("[placement] {}".format(label))
     print(
-        "[event] Locality policy migration: {}/{} appId={} msgId={} "
-        "source={} expected={}".format(
-            SERVICE_USER,
-            service_func,
-            target_info["app_id"],
-            target_info["msg_id"],
-            source_host,
-            expected_host,
+        "         {:<24} {:<16} {:<14} {:<14} {}".format(
+            "service",
+            "host",
+            "appId",
+            "messageId",
+            "endpoint",
         )
     )
 
-    event_start_s = time()
+    placements = {}
 
-    print("         Setting scheduler policy to {}...".format(LOCALITY_POLICY))
-    set_planner_policy(LOCALITY_POLICY)
-    sleep(0.5)
-
-    print("         Evicting source host {}...".format(source_host))
-    set_next_evicted_host([source_host])
-
-    moved_endpoint = _wait_for_service_moved_from(
-        SERVICE_USER,
-        service_func,
-        source_host,
-        ini_file=ini_file,
-    )
-
-    moved_host = _endpoint_host(moved_endpoint)
-    moved_to_expected = (
-        moved_host == expected_host or expected_host in str(moved_endpoint)
-    )
-
-    if not moved_to_expected:
-        raise RuntimeError(
-            "Locality policy moved {}/{} to {}, expected {}".format(
+    for service_func in services:
+        try:
+            endpoint = discover_service(
                 SERVICE_USER,
                 service_func,
-                moved_endpoint,
-                expected_host,
+                ini_file=ini_file,
+            )
+        except Exception as e:
+            print(
+                "         {:<24} ERROR: {}".format(
+                    service_func,
+                    e,
+                )
+            )
+            placements[service_func] = {
+                "host": "",
+                "app_id": "",
+                "message_id": "",
+                "endpoint": "",
+                "error": str(e),
+            }
+            continue
+
+        if endpoint is None:
+            print(
+                "         {:<24} {:<16} {:<14} {:<14} {}".format(
+                    service_func,
+                    "<none>",
+                    "",
+                    "",
+                    "",
+                )
+            )
+            placements[service_func] = {
+                "host": "",
+                "app_id": "",
+                "message_id": "",
+                "endpoint": "",
+            }
+            continue
+
+        host = _endpoint_host(endpoint) or ""
+        app_id = _endpoint_field(endpoint, "appId", "appid", "app_id")
+        msg_id = _endpoint_field(endpoint, "messageId", "messageid", "message_id")
+
+        print(
+            "         {:<24} {:<16} {:<14} {:<14} {}".format(
+                service_func,
+                str(host),
+                str(app_id),
+                str(msg_id),
+                str(endpoint),
             )
         )
 
-    event_end_s = time()
+        placements[service_func] = {
+            "host": str(host),
+            "app_id": str(app_id),
+            "message_id": str(msg_id),
+            "endpoint": str(endpoint),
+        }
 
-    print(
-        "         Policy moved {}/{} to expected host: {}".format(
-            SERVICE_USER,
-            service_func,
-            moved_endpoint,
-        )
-    )
+    print("")
 
-    return {
-        "event_success": 1,
-        "event_start_s": event_start_s,
-        "event_end_s": event_end_s,
-        "event_duration_s": event_end_s - event_start_s,
-        "event_endpoint": str(moved_endpoint),
-        "moved_host": moved_host,
-        "moved_to_expected": 1 if moved_to_expected else 0,
-        "target_app_id": target_info["app_id"],
-        "target_msg_id": target_info["msg_id"],
-    }
+    return placements
+
+
+def _placement_summary_string(placements):
+    parts = []
+
+    for service_func in SERVICES:
+        entry = placements.get(service_func, {})
+        host = entry.get("host", "")
+        parts.append("{}={}".format(service_func, host))
+
+    return ";".join(parts)
+
+
+def _count_colocated_services(placements, target_service):
+    target_host = placements.get(target_service, {}).get("host", "")
+
+    if not target_host:
+        return 0
+
+    count = 0
+
+    for service_func, entry in placements.items():
+        if service_func == target_service:
+            continue
+
+        if entry.get("host", "") == target_host:
+            count += 1
+
+    return count
 
 
 def _run_client_once(
@@ -858,15 +884,19 @@ def run_once(
 
     Scenarios:
       static_bad:
-        UserService starts on the bad host and stays there.
+        UserService starts on the bad host and stays there under the static
+        policy.
 
       static_good:
-        UserService starts on the affinity host and stays there.
+        UserService starts on the manually good/affinity host and stays there
+        under the static policy.
 
       policy:
-        UserService starts on the bad host. A telemetry warmup is run, then the
-        planner policy is switched to "service" and the bad host is evicted.
-        The locality scheduler should migrate UserService to the affinity host.
+        UserService starts in the same placement as static_bad. The planner is
+        switched to the service-locality policy and a policy warmup phase
+        generates RPC dependency telemetry. The measured benchmark then runs
+        without forcing, waiting for, or asserting any specific migration. Final
+        placements are observed before cleanup.
     """
     if scenario not in LOCALITY_SCENARIOS:
         raise ValueError(
@@ -893,19 +923,10 @@ def run_once(
     print("placements={}".format(placements))
 
     telemetry_row = None
+    measured_row = None
 
-    event_info = {
-        "event_success": 1,
-        "event_duration_s": 0,
-        "event_endpoint": "",
-        "moved_host": "",
-        "moved_to_expected": 0,
-        "target_app_id": "",
-        "target_msg_id": "",
-    }
-
-    # Start all scenarios under the static policy. For the policy scenario, we
-    # switch to service mode only after collecting telemetry.
+    # Start all scenarios under the static policy. The policy scenario switches
+    # to service mode only after the initial bad placement has been established.
     planner_policy = LOCALITY_STATIC_POLICY
 
     try:
@@ -924,8 +945,22 @@ def run_once(
         target_info = started[target_service]
         initial_endpoint = target_info["endpoint"]
 
+        initial_placements = _observe_service_placements(
+            "initial placements after startup",
+            ini_file=ini_file,
+        )
+
+        initial_target_host = initial_placements.get(
+            target_service,
+            {},
+        ).get("host", "")
+
         if scenario == "policy":
-            print("[4/5] Running telemetry warmup before policy migration...")
+            print("[4/5] Enabling locality scheduler policy...")
+            set_planner_policy(LOCALITY_POLICY)
+            sleep(0.5)
+
+            print("[4/5] Running policy warmup before measured benchmark...")
 
             telemetry_row = _run_client_once(
                 ini_file=ini_file,
@@ -939,7 +974,7 @@ def run_once(
                 warmup_requests=0,
                 verify_storage=_as_bool(verify_storage),
                 client_host=roles["client_host"],
-                scenario="policy_telemetry",
+                scenario="policy_warmup",
                 target_service=target_service,
                 repeat=repeat,
                 out_dir=out_dir,
@@ -947,22 +982,13 @@ def run_once(
 
             if int(telemetry_row["failures"]) != 0:
                 raise RuntimeError(
-                    "Telemetry warmup had {} failures".format(
+                    "Policy warmup had {} failures".format(
                         telemetry_row["failures"]
                     )
                 )
 
-            print("[event] Triggering locality-policy migration...")
-
-            event_info = _trigger_locality_policy_migration(
-                target_info,
-                source_host=roles["bad_host"],
-                expected_host=roles["affinity_host"],
-                ini_file=ini_file,
-            )
-
-            # Give discovery and any late planner messages time to settle.
-            sleep(1.0)
+            # Do not wait for convergence and do not assert a destination. The
+            # measured run observes whatever placement the policy has produced.
 
         print("[5/5] Running measured ComposePost benchmark...")
 
@@ -984,14 +1010,42 @@ def run_once(
             out_dir=out_dir,
         )
 
-        if scenario == "policy":
-            final_endpoint = event_info["event_endpoint"]
-        else:
-            final_endpoint = discover_service(
-                SERVICE_USER,
-                target_service,
-                ini_file=ini_file,
-            )
+        final_placements = _observe_service_placements(
+            "final placements before cleanup",
+            ini_file=ini_file,
+        )
+
+        target_final = final_placements.get(target_service, {})
+        final_endpoint = target_final.get("endpoint", "")
+        final_target_host = target_final.get("host", "")
+
+        compose_host = final_placements.get(
+            "ComposePostService",
+            {},
+        ).get("host", "")
+
+        userdb_host = final_placements.get(
+            "UserDbService",
+            {},
+        ).get("host", "")
+
+        target_moved = (
+            bool(initial_target_host)
+            and bool(final_target_host)
+            and initial_target_host != final_target_host
+        )
+
+        target_colocated_with_compose = (
+            bool(final_target_host)
+            and bool(compose_host)
+            and final_target_host == compose_host
+        )
+
+        target_colocated_with_userdb = (
+            bool(final_target_host)
+            and bool(userdb_host)
+            and final_target_host == userdb_host
+        )
 
         measured_row.update(
             {
@@ -1006,21 +1060,29 @@ def run_once(
 
                 "initial_endpoint": initial_endpoint,
                 "final_endpoint": str(final_endpoint),
+                "initial_target_host": initial_target_host,
+                "final_target_host": final_target_host,
+                "target_moved": 1 if target_moved else 0,
+                "target_colocated_with_compose": 1
+                if target_colocated_with_compose else 0,
+                "target_colocated_with_userdb": 1
+                if target_colocated_with_userdb else 0,
+                "target_colocated_services": _count_colocated_services(
+                    final_placements,
+                    target_service,
+                ),
+                "placement_summary": _placement_summary_string(final_placements),
 
-                "event_success": int(event_info["event_success"]),
-                "event_duration_s": event_info["event_duration_s"],
-                "moved_host": event_info["moved_host"],
-                "moved_to_expected": event_info["moved_to_expected"],
-                "target_app_id": event_info["target_app_id"],
-                "target_msg_id": event_info["target_msg_id"],
+                "target_app_id": target_info["app_id"],
+                "target_msg_id": target_info["msg_id"],
 
-                "telemetry_requests": int(telemetry_requests)
+                "policy_warmup_requests": int(telemetry_requests)
                 if scenario == "policy"
                 else 0,
-                "telemetry_successes": int(telemetry_row["successes"])
+                "policy_warmup_successes": int(telemetry_row["successes"])
                 if telemetry_row is not None
                 else 0,
-                "telemetry_failures": int(telemetry_row["failures"])
+                "policy_warmup_failures": int(telemetry_row["failures"])
                 if telemetry_row is not None
                 else 0,
             }
@@ -1126,9 +1188,9 @@ def run(
       --worker-hosts h0,h1,h2,h3
 
     Host order:
-      h0 = client host
-      h1 = affinity/good host
-      h2 = bad UserService host
+      h0 = client host and ComposePostService host
+      h1 = manually good/affinity host
+      h2 = bad initial UserService host
       h3 = auxiliary services host
     """
     if worker_hosts is None:
