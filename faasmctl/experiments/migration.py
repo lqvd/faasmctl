@@ -594,6 +594,46 @@ def _shutdown_service_stack(ini_file=None):
     )
     sleep(SERVICE_QUIESCE_PERIOD_S)
 
+def _trigger_steady_state(
+    target_info,
+    source_host=None,
+    dest_host=None,
+    ini_file=None,
+):
+    """
+    No-disruption baseline.
+
+    This is deliberately a no-op. It records a pseudo-event at the same point
+    in the benchmark where migration or drain/restart would normally be
+    triggered, so that steady-state runs have the same summary schema as
+    disruption runs.
+    """
+    print(
+        "[event] Steady state: no migration/restart for {}/{} appId={} msgId={}".format(
+            SERVICE_USER,
+            target_info["function"],
+            target_info["app_id"],
+            target_info["msg_id"],
+        )
+    )
+
+    event_start_s = time()
+
+    # Do not perturb the system. Reuse the endpoint recorded when the service
+    # was started rather than polling discovery again.
+    endpoint = target_info.get("endpoint", "")
+
+    event_end_s = time()
+
+    return {
+        "event_success": 1,
+        "event_start_s": event_start_s,
+        "event_end_s": event_end_s,
+        "event_duration_s": event_end_s - event_start_s,
+        "event_endpoint": endpoint,
+        "target_app_id": target_info["app_id"],
+        "target_msg_id": target_info["msg_id"],
+    }
 
 def _trigger_live_migration(
     target_info,
@@ -950,7 +990,14 @@ def run_once(
             print("[5/6] Waiting {}s before event...".format(trigger_after_s))
             sleep(float(trigger_after_s))
 
-            if scenario == "live_migration":
+            if scenario == "steady_state":
+                event_info = _trigger_steady_state(
+                    target_info,
+                    source_host=source_host,
+                    dest_host=dest_host,
+                    ini_file=ini_file,
+                )
+            elif scenario == "live_migration":
                 event_info = _trigger_live_migration(
                     target_info,
                     source_host=source_host,
