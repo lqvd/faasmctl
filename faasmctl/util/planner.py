@@ -1,7 +1,7 @@
 from faasmctl.util.config import get_faasm_ini_file, get_faasm_planner_host_port
 from faasmctl.util.gen_proto.planner_pb2 import (
     AvailableHostsResponse,
-    DiscoverServiceResponse,
+    DiscoverServiceRequest,
     ServiceReadyNotification,
     GetInFlightAppsResponse,
     HttpMessage,
